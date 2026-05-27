@@ -1,0 +1,13 @@
+{
+  "name": "youtube-playlist-url-mcp",
+  "version": "0.1.0",
+  "description": "Minimal MCP server: resolves track strings to YouTube video IDs and emits a watch_videos URL.",
+  "type": "module",
+  "main": "index.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  }
+}

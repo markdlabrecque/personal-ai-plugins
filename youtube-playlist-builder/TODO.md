@@ -1,0 +1,3 @@
+- look into making this skill more efficient
+  - less hallucinations, quicker resolutions, lower token spend
+- support custom themes, locally configurable

@@ -1,0 +1,9 @@
+{
+  "name": "value-estimates",
+  "version": "0.1.0",
+  "description": "Generate a value-based estimate report: pull tickets delivered in a date range from daily reports, cross-reference GitLab issues for effort, and compare to Harvest actuals.",
+  "author": {
+    "name": "Mark Labrecque",
+    "email": "mark@affinitybridge.com"
+  }
+}
