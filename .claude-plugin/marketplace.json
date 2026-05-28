@@ -1,0 +1,19 @@
+{
+  "name": "marks-personal-plugins",
+  "owner": {
+    "name": "Mark Labrecque",
+    "email": "mark@affinitybridge.com"
+  },
+  "plugins": [
+    {
+      "name": "value-estimates",
+      "source": "./value-estimates",
+      "description": "Generate a value-based estimate report: pull tickets delivered in a date range from daily reports, cross-reference GitLab issues for effort, and compare to Harvest actuals."
+    },
+    {
+      "name": "youtube-playlist-builder",
+      "source": "./youtube-playlist-builder",
+      "description": "Build YouTube music playlists from a mood/likes/dislikes descriptor. Claude curates the tracklist, searches each track on YouTube, and assembles the playlist."
+    }
+  ]
+}
