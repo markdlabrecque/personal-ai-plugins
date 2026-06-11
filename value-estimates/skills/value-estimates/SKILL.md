@@ -43,13 +43,13 @@ Run `glab auth status` once. If it fails (not installed, not authenticated, netw
 
 ## Step 3: Collect ticket IDs from daily reports
 
-Read every `~/daily_reports/YYYY-MM-DD-*.md` in the date range. Extract:
+Read every daily report in the date range. JSONL (`~/daily_reports/YYYY-MM-DD-*.jsonl`) is the source of truth — it's the only format written now. For each date, **prefer the `.jsonl`; fall back to the legacy `.md` only when no `.jsonl` exists for that date** (older, pre-JSONL dates). Never read both for the same date — they hold overlapping events and would double-count. Extract:
 
-- All ticket references — prefer the `**Tickets:**` line if present (authoritative; one or more `#NNN` separated by commas). Otherwise scan the entry body for `#123`, `(#123)`, `ticket #123`, `(ticket #123)`. Capture the bare integer.
-- The project context for each entry (the same fuzzy-matching rules used by the timesheet skill — `**Project:** name`, `### date — name`, freeform mention).
-- Skip entries that don't belong to the requested Harvest project. Daily reports are noisy; only keep entries whose project context matches.
+- **JSONL** — each line is one event with `source` (`commit`/`session`/`manual`), `tickets` (array of `#NNN`, authoritative), `repo`/`project` (project context), and `summary`. Capture the bare integer from each `tickets[]` entry. If `tickets` is empty, scan `summary` for `#123`, `(#123)`, `ticket #123`. Ignore `session` events whose `summary` is `null` (uncaptured) unless they carry a ticket.
+- **Legacy Markdown** — prefer the `**Tickets:**` line if present (authoritative; one or more `#NNN` separated by commas). Otherwise scan the entry body for `#123`, `(#123)`, `ticket #123`. Project context comes from `**Project:** name`, `### date — name`, or a freeform mention.
+- Skip events that don't belong to the requested Harvest project. Daily reports are noisy; only keep events whose project context matches.
 
-Record, per ticket ID: the set of dates it appeared on, and the `###` headers it appeared under (used as fallback context if the GitLab ticket has no spec).
+Record, per ticket ID: the set of dates it appeared on, and the `summary`/`###` text it appeared under (used as fallback context if the GitLab ticket has no spec).
 
 If the same ticket has multiple project contexts across days, prefer the matched one but note the ambiguity in the report.
 
