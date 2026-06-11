@@ -1,0 +1,9 @@
+{
+  "name": "mr",
+  "version": "0.1.0",
+  "description": "Create a merge/pull request from a feature branch off develop: confirm branch state (no worktrees), run tests, rebase onto develop, then commit, push, open the MR, and merge only after explicit confirmation.",
+  "author": {
+    "name": "Mark Labrecque",
+    "email": "mark@affinitybridge.com"
+  }
+}

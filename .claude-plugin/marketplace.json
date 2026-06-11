@@ -14,6 +14,11 @@
       "name": "youtube-playlist-builder",
       "source": "./youtube-playlist-builder",
       "description": "Build YouTube music playlists from a mood/likes/dislikes descriptor. Claude curates the tracklist, searches each track on YouTube, and assembles the playlist."
+    },
+    {
+      "name": "mr",
+      "source": "./mr",
+      "description": "Create a merge/pull request from a feature branch off develop: confirm branch state (no worktrees), run tests, rebase onto develop, then commit, push, open the MR, and merge only after explicit confirmation."
     }
   ]
 }
