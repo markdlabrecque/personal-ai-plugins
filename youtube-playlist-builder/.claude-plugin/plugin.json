@@ -1,9 +1,15 @@
 {
   "name": "youtube-playlist-builder",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Build YouTube music playlists from a mood/likes/dislikes descriptor. Claude curates the tracklist, searches each track on YouTube, and assembles the playlist.",
   "author": {
     "name": "Mark Labrecque",
     "email": "mark@affinitybridge.com"
+  },
+  "mcpServers": {
+    "youtube-playlist-url": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/mcp-server/server.bundle.js"]
+    }
   }
 }
