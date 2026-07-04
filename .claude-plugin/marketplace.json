@@ -19,6 +19,11 @@
       "name": "mr",
       "source": "./mr",
       "description": "Create a merge/pull request from a feature branch off develop: confirm branch state (no worktrees), run tests, rebase onto develop, then commit, push, open the MR, and merge only after explicit confirmation."
+    },
+    {
+      "name": "context-management",
+      "source": "./context-management",
+      "description": "Keep Claude context lean and correct. optimize is the entry point: it audits context files, skills, and memory in one pass and hands findings off to whichever specialist fits — extract-to-skill, skill-registry-audit, memory-to-context, memory-hygiene."
     }
   ]
 }

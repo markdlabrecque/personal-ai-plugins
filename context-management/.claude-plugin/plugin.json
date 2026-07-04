@@ -1,0 +1,9 @@
+{
+  "name": "context-management",
+  "version": "0.3.0",
+  "description": "Skills for keeping Claude context lean, accurate, and correctly registered. Start with optimize, the roll-up entry point: it audits a scope (CLAUDE.md/AGENTS.md, skills, memory), fixes redundant/contradictory/dead instructions directly, and surfaces candidates for the specialist skills it hands off to: extract-to-skill (pull misplaced-weight content into its own skill), skill-registry-audit (find duplicate or broken skill registrations), memory-to-context (promote team-useful project memories into tracked project docs), and memory-hygiene (dedupe and prune stale memory in place). Each specialist also triggers standalone.",
+  "author": {
+    "name": "Mark Labrecque",
+    "email": "mark@affinitybridge.com"
+  }
+}
