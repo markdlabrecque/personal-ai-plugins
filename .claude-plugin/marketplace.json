@@ -19,6 +19,11 @@
       "name": "context-management",
       "source": "./context-management",
       "description": "Keep Claude context lean and correct. optimize is the entry point: it audits context files, skills, and memory in one pass and hands findings off to whichever specialist fits — extract-to-skill, skill-registry-audit, memory-to-context, memory-hygiene."
+    },
+    {
+      "name": "lsp-servers",
+      "source": "./lsp-servers",
+      "description": "Language servers for PHP (Intelephense), Python (pyright), Rust (rust-analyzer), and bash (bash-language-server), exposing the built-in LSP tool to agents."
     }
   ]
 }

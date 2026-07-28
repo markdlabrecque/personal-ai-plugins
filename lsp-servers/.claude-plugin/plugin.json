@@ -1,0 +1,9 @@
+{
+  "name": "lsp-servers",
+  "version": "0.1.0",
+  "description": "Language servers for PHP (Intelephense), Python (pyright), Rust (rust-analyzer), and bash (bash-language-server), exposing the built-in LSP tool to agents.",
+  "author": {
+    "name": "Mark Labrecque",
+    "email": "mark@affinitybridge.com"
+  }
+}

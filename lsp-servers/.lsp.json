@@ -1,0 +1,22 @@
+{
+  "python": {
+    "command": "pyright-langserver",
+    "args": ["--stdio"],
+    "extensionToLanguage": { ".py": "python", ".pyi": "python" }
+  },
+  "php": {
+    "command": "intelephense",
+    "args": ["--stdio"],
+    "extensionToLanguage": { ".php": "php" }
+  },
+  "rust": {
+    "command": "rust-analyzer",
+    "args": [],
+    "extensionToLanguage": { ".rs": "rust" }
+  },
+  "bash": {
+    "command": "bash-language-server",
+    "args": ["start"],
+    "extensionToLanguage": { ".sh": "shellscript", ".bash": "shellscript" }
+  }
+}
