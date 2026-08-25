@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cmd=$(jq -r '.tool_input.command // empty'); if echo \"$cmd\" | grep -qE '(^|[^a-zA-Z0-9_])git[[:space:]]+commit([[:space:]]|$)'; then \"${CLAUDE_PLUGIN_ROOT}/hooks/daily-log.sh\" < /dev/null; fi"
+            "command": "payload=$(cat); cmd=$(printf '%s' \"$payload\" | jq -r '.tool_input.command // empty'); if printf '%s' \"$cmd\" | grep -qE '(^|[^a-zA-Z0-9_])git[[:space:]][^;&|]*commit'; then printf '%s' \"$payload\" | \"${CLAUDE_PLUGIN_ROOT}/hooks/daily-log.sh\"; fi"
           }
         ]
       }

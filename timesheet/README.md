@@ -9,6 +9,33 @@ Fill out Harvest timesheets from daily log markdown files in `~/daily_reports/`.
 > the same `~/daily_reports/` and `meta/projects.yml` contract. Upstream
 > changes are pulled in by hand, not merged. See `docs/roadmap.md`.
 
+### Fork changes
+
+**0.4.1 — commit capture works under a bare + worktree layout.**
+
+`hooks/daily-log.sh` no longer reads `git log -1` from the hook's own working
+directory. Claude Code runs hooks in the session's project directory, and a `cd`
+inside a Bash tool call does not leak out to the hook — so for a repo laid out as
+`project/.bare` plus `project/work/<repo>/<branch>` worktrees, cwd landed on the
+bare parent and the hook read an unrelated branch tip. The SHA dedupe then
+dropped the event silently, with no error and no log line.
+
+It now sweeps instead: it collects the payload `cwd` plus any `cd` or `git -C`
+target named in the command, expands each to *all* worktrees of its repo, and
+logs every worktree HEAD that is recent and not already recorded. Only one
+commit per worktree is considered, so a rebase adds one line rather than fifty,
+and an age window (`DAILY_LOG_WINDOW_SECONDS`, default 600) stops a first sweep
+from backfilling months of history as today's work.
+
+Two supporting changes:
+
+- `hooks/hooks.json` now forwards the payload to the script. It previously ran
+  it with `< /dev/null`, which the sweep cannot work from.
+- The matcher widened from `git<space>commit` to allow flags in between, so
+  forms like `git -c core.hooksPath=/dev/null commit` are caught. Over-matching
+  is deliberately safe now — a redundant sweep finds nothing and costs nothing,
+  while a missed commit is unrecoverable.
+
 ## What it does
 
 Two parts:
