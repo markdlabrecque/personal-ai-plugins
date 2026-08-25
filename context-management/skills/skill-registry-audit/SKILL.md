@@ -1,6 +1,6 @@
 ---
 name: skill-registry-audit
-description: Audit the skill inventory itself — not instruction content — for duplicate skills registered in more than one place, settings.json entries enabling a plugin that no longer exists, installed plugins that were never enabled, and drift between a skill's SKILL.md description and its plugin.json/marketplace.json listing. Use whenever the user asks to audit skills, find duplicate skills, clean up plugins, check what's enabled vs installed, or asks why a skill isn't triggering when it seems like it should be registered. Distinct from the optimize skill, which audits instruction text for redundancy — this one audits the registry that makes skills discoverable in the first place.
+description: Audit the skill registry itself — skills registered in more than one place, settings entries enabling missing plugins, installed-but-never-enabled plugins, and SKILL.md vs marketplace.json drift. Use on "audit skills", "find duplicate skills", "clean up plugins", or when a registered skill isn't triggering. (optimize audits instruction text; this audits the registry.)
 ---
 
 # skill-registry-audit

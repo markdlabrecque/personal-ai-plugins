@@ -1,6 +1,6 @@
 ---
 name: value-estimates
-description: "Generate a value-based estimate report for a project — pulls tickets delivered in a given time period from daily reports, cross-references each with its GitLab issue to derive an effort estimate, and compares against actual hours logged in Harvest. Trigger this skill whenever the user asks for value-based estimates, an estimate report, a delivery/effort summary for a project, or anything resembling 'how much did we estimate vs actually spend on project X', even if they don't use the exact phrase 'value-based estimate'. Required: Harvest project name. Optional: time range (default last 30 days), GitLab label filter."
+description: Generate a value-based estimate report for a project — tickets delivered in a period (from daily reports) cross-referenced with GitLab issues for effort estimates, compared against actual hours logged in Harvest. Use when the user asks for value-based estimates, an estimate report, or "estimated vs actual spend on project X". Requires the Harvest project name; optional time range and label filter.
 ---
 
 # Value Estimates Skill

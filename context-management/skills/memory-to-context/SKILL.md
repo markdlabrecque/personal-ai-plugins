@@ -1,6 +1,6 @@
 ---
 name: memory-to-context
-description: Review a project's Claude memory files and promote the ones with durable, team-wide value (facts about the codebase, architecture, conventions, or decisions) into the project's own tracked documentation — AGENTS.md, README, docs/*.md — so the whole team can see them, then remove them from memory once promoted. Use whenever the user asks to promote memories to docs, get something out of memory and into the repo, wants memory content visible to teammates, or is auditing/cleaning up project memory. Do not promote memories about the user's own personal workflow habits or how they like Claude to behave — those are personal, not project knowledge, and don't belong in team docs.
+description: Promote Claude memory files with durable, team-wide value (codebase facts, architecture, conventions, decisions) into the project's tracked docs — AGENTS.md, README, docs/ — then remove them from memory. Use when the user wants memories promoted to docs or memory content visible to teammates. Never promote personal workflow preferences; those stay in memory.
 ---
 
 # memory-to-context

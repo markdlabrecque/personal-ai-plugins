@@ -1,6 +1,6 @@
 ---
 name: optimize
-description: The entry point for auditing and cleaning up Claude context — CLAUDE.md/AGENTS.md, their @-imports, the skills that live in that scope, and that scope's memory. Fixes redundant/contradictory/dead instructions directly, and surfaces candidates for the other context-management skills (misplaced content to extract, duplicate/broken skill registrations, memory worth promoting to team docs, memory worth pruning) rather than trying to do all of it inline itself. Use whenever the user asks to audit, clean up, or review CLAUDE.md, AGENTS.md, project instructions, context files, memory, or skills for duplication, conflicts, staleness, or bloat — even if they only name one file or one narrow problem, since overlap usually spans several. Also trigger on "optimize context", "clean up instructions", "is this redundant", "find contradictions in my rules", "audit my context/memory/skills". Takes a scope of "project" or "global" (global = user-level ~/.claude); if the user doesn't say which, ask before doing anything.
+description: Entry point for auditing and cleaning up Claude context — CLAUDE.md/AGENTS.md, their @-imports, skills, and memory in a scope. Fixes redundant, contradictory, or dead instructions directly and routes bigger findings to the other context-management skills. Use on "optimize context", "audit / clean up CLAUDE.md or instructions", "find contradictions in my rules". Takes scope "project" or "global"; ask if unstated.
 ---
 
 # optimize
