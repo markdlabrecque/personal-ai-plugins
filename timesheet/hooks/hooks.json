@@ -1,0 +1,25 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cmd=$(jq -r '.tool_input.command // empty'); if echo \"$cmd\" | grep -qE '(^|[^a-zA-Z0-9_])git[[:space:]]+commit([[:space:]]|$)'; then \"${CLAUDE_PLUGIN_ROOT}/hooks/daily-log.sh\" < /dev/null; fi"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/session-log.sh\""
+          }
+        ]
+      }
+    ]
+  }
+}

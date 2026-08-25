@@ -1,0 +1,24 @@
+# Fixture project map for timesheet evals.
+projects:
+  - harvest: "Internal | Acme"
+    log_aliases: ["internal", "ab", "admin"]
+    internal: true
+    admin_task: "Admin"
+
+  - harvest: "Island Health - Main"
+    gitlab: "acme/island-health/main-site"
+    log_aliases: ["islandhealth", "ih", "island-health"]
+
+  - harvest: "Client Portal - API"
+    gitlab: "acme/client-portal/api"
+    log_aliases: ["clientportal", "portal", "cp"]
+
+  - log_aliases: ["sideproject"]
+    excluded: true
+
+  # Multi-project codebase: one repo billing to two Harvest projects.
+  - gitlab: "acme/omni/platform"
+    log_aliases: ["omni"]
+    harvest:
+      - "Omni - Retainer"
+      - "Omni - Phase 2"

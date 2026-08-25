@@ -1,0 +1,97 @@
+{
+  "skill_name": "timesheet",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Run the timesheet skill in --dry-run for 2026-04-13 only. Set DAILY_REPORTS_DIR=evals/files (relative to the skill root) so it reads the fixture meta dir and the fixture daily report. Print the planned-entries summary table and stop.",
+      "expected_output": "A markdown table covering 2026-04-13 with: two #265 commits collapsed into one ticket-265 entry on 'Island Health - Main', one ticket-266 entry on 'Island Health - Main', one no-ticket entry on 'Island Health - Main' for the merge commit, and one admin entry on the internal project. All hours should be 0.02. No Harvest POSTs and no tickets.json writes.",
+      "files": [
+        "evals/files/meta/projects.yml",
+        "evals/files/meta/local-context.md",
+        "evals/files/reports/2026-04-13-Monday.md"
+      ],
+      "expectations": [
+        "The summary table contains exactly one row for ticket #265 with both commit subjects bulleted in its Summary column",
+        "The summary table contains exactly one row for ticket #266 on the same date",
+        "The merge commit appears in a no-ticket row (Ticket column shows '(none)' or equivalent), not duplicated under a ticket bucket",
+        "The summary table includes one admin entry on the internal project with Ticket column '—'",
+        "Every Hours value in the summary table is 0.02",
+        "No call to mcp__harvest__harvest_create_time_entry is made",
+        "No file is written under evals/files/meta/tickets.json"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "Run the timesheet skill in --dry-run for 2026-04-14 only, using DAILY_REPORTS_DIR=evals/files. Print the planned-entries summary table.",
+      "expected_output": "The cross-cutting entry with **Tickets:** #142, #143 should DUPLICATE — producing one 0.02h entry on Client Portal - API for #142 and another 0.02h entry on Client Portal - API for #143. The 11:20 commit referencing #143 collapses into the existing #143 bucket (same notes list grows to 2 items). The sideproject entry is silently skipped (excluded). No admin entry is created on a Tuesday — wait, Tuesday is a weekday, so an admin entry IS created.",
+      "files": [
+        "evals/files/meta/projects.yml",
+        "evals/files/reports/2026-04-14-Tuesday.md"
+      ],
+      "expectations": [
+        "The **Tickets:** line is treated as authoritative and produces two entries (#142 and #143), not split — each at 0.02h",
+        "The #143 entry's Summary column contains BOTH the 'Refactor session-token storage' bullet AND the 'Tighten validation on /api/auth/refresh' bullet (commits collapse across the structured-line and the body-regex source)",
+        "No entry is generated for the sideproject log entry (excluded project, silent skip)",
+        "An admin entry IS created for 2026-04-14 (Tuesday is a weekday)",
+        "The skipped sideproject entry is mentioned in the final 'skipped' summary list, not in the planned-entries table"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "Run the timesheet skill in --dry-run for 2026-04-15 only, using DAILY_REPORTS_DIR=evals/files. The first log entry on that day has no ticket reference — when the skill prompts, REPLY '#268' to link it. Print the planned-entries summary table.",
+      "expected_output": "The 09:00 entry without a ticket prompts the user inline; given the reply '#268', it joins (or creates) a #268 bucket on Island Health - Main. The 14:00 #266 entry creates its own bucket. No backfill is written into the markdown source. Plus the Wednesday admin entry.",
+      "files": [
+        "evals/files/meta/projects.yml",
+        "evals/files/reports/2026-04-15-Wednesday.md"
+      ],
+      "expectations": [
+        "The skill prompts the user inline about the no-ticket 09:00 entry before printing the plan",
+        "After the user replies '#268', the planned-entries table contains a row for ticket #268 on Island Health - Main",
+        "The fixture markdown file evals/files/reports/2026-04-15-Wednesday.md is NOT modified (no **Tickets:** line is written back)",
+        "The planned-entries table contains a separate row for ticket #266"
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "Run the timesheet skill in --dry-run for 2026-04-18 only (Saturday), using DAILY_REPORTS_DIR=evals/files. Print the planned-entries summary table.",
+      "expected_output": "The Saturday hotfix #270 entry produces one ticket-270 row on Island Health - Main at 0.02h. Crucially, NO admin entry is generated (weekends skip the daily admin entry).",
+      "files": [
+        "evals/files/meta/projects.yml",
+        "evals/files/reports/2026-04-18-Saturday.md"
+      ],
+      "expectations": [
+        "The planned-entries table contains exactly one row for ticket #270 on 2026-04-18",
+        "The planned-entries table does NOT contain an admin entry for 2026-04-18 (weekend rule)"
+      ]
+    },
+    {
+      "id": 5,
+      "prompt": "Verify sidecar upsert logic. Pre-seed evals/files/meta/tickets.json with an existing entry for 'ih#266' showing first_seen=2026-04-13, last_seen=2026-04-13, days_active=1, harvest_hours=0.02, harvest_entry_ids=[1001]. Then run the timesheet skill (NOT in dry-run) for 2026-04-15, using DAILY_REPORTS_DIR=evals/files. Mock the Harvest POST so it returns synthetic entry id 2002 for the new #266 entry on 2026-04-15. Verify how the sidecar gets updated.",
+      "expected_output": "After the run, tickets.json should show ih#266 with last_seen=2026-04-15, days_active=2, harvest_entry_ids=[1001, 2002] (de-duped, append-only set). first_seen stays at 2026-04-13. A new ih#268 key is created (from the linked-by-prompt entry, if the eval supplies that prompt) — or simply ih#266 alone is updated if #268 isn't part of this eval's scope.",
+      "expectations": [
+        "tickets.json key ih#266 has last_seen='2026-04-15' after the run",
+        "tickets.json key ih#266 has days_active=2 after the run",
+        "tickets.json key ih#266 has harvest_entry_ids equal to [1001, 2002] in some order, with no duplicates",
+        "tickets.json key ih#266 has first_seen='2026-04-13' (unchanged)",
+        "The sidecar file is written atomically (a tickets.json.tmp must not be left behind on disk)"
+      ]
+    },
+    {
+      "id": 6,
+      "prompt": "Run the timesheet skill in --dry-run for 2026-04-16 only (Thursday), using DAILY_REPORTS_DIR=evals/files. The 'omni' codebase maps to two Harvest projects. When the skill asks which project applies, reply '1' for the #412 entry and '2' for the #419 entry. Print the planned-entries summary table.",
+      "expected_output": "The 'omni' codebase (log_aliases: [omni]) resolves to a multi-project projects.yml entry (harvest: [Omni - Retainer, Omni - Phase 2]), so the skill prompts once per (codebase, ticket). Given '1' for #412 and '2' for #419: the #412 row lands on 'Omni - Retainer' and the #419 row lands on 'Omni - Phase 2', both 0.02h. Plus the Thursday admin entry. No Harvest POSTs.",
+      "files": [
+        "evals/files/meta/projects.yml",
+        "evals/files/reports/2026-04-16-Thursday.md"
+      ],
+      "expectations": [
+        "The skill prompts to disambiguate the Harvest project for the 'omni' codebase because its projects.yml entry lists more than one harvest project",
+        "It prompts separately for #412 and #419 (cache key is (codebase, ticket)), not once for the whole codebase",
+        "After replies '1' and '2': the #412 row's Harvest Project is 'Omni - Retainer' and the #419 row's is 'Omni - Phase 2'",
+        "Both omni rows are 0.02h and are flagged as disambiguated in the summary table",
+        "An admin entry IS created for 2026-04-16 (Thursday is a weekday)",
+        "No call to mcp__harvest__harvest_create_time_entry is made"
+      ]
+    }
+  ]
+}

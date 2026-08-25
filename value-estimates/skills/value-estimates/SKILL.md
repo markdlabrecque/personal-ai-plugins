@@ -209,4 +209,4 @@ The `docs/value-estimates/` folder should be gitignored (these reports often con
 
 ## Roadmap
 
-This skill has known limitations that depend on improvements to the timesheet skill and on richer per-entry data. See `docs/timesheet-roadmap.md` in this skill's directory for the proposed changes.
+This skill has known limitations that depend on improvements to the timesheet skill and on richer per-entry data. See `timesheet/docs/roadmap.md` in this repo for the proposed changes.

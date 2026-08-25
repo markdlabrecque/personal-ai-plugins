@@ -1,0 +1,77 @@
+#!/bin/bash
+# worklog — manual quick-capture for the daily log.
+#
+# Appends a single `source:"manual"` JSON event to today's
+# ~/daily_reports/{YYYY-MM-DD-Day}.jsonl. This is the catch-all for billable
+# work that no hook can see: phone calls, meetings, whiteboarding, pairing,
+# research that never commits, ops done in a web console, etc.
+#
+# Usage:
+#   worklog "call with Island Health re: search rollout"
+#   worklog -p ih -t '#189' "reviewed staging deploy, found nav regression"
+#   worklog --project acr "client onboarding call"
+#
+# Flags:
+#   -p, --project SLUG   project slug (a log_aliases token from projects.yml)
+#   -t, --ticket  #NNN   ticket reference; repeatable. Bare #NNN tokens found
+#                        in the free text are also captured automatically.
+#
+# JSONL is appended atomically (one line, one write) so it never interleaves
+# with the commit or session hooks writing the same file concurrently.
+
+set -euo pipefail
+
+command -v jq >/dev/null 2>&1 || { echo "worklog: jq is required" >&2; exit 1; }
+
+project=""
+tickets=()
+args=()
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p|--project) project="${2:-}"; shift 2 ;;
+    -t|--ticket)  tickets+=("${2:-}"); shift 2 ;;
+    -h|--help)
+      sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    --) shift; args+=("$@"); break ;;
+    *)  args+=("$1"); shift ;;
+  esac
+done
+
+summary="${args[*]:-}"
+if [ -z "${summary// }" ]; then
+  echo "worklog: nothing to log. Pass a summary, e.g. worklog \"did X\"" >&2
+  exit 1
+fi
+
+# Normalize explicit -t tickets to "#NNN", then merge with any #NNN in the text.
+norm_tickets=()
+for t in "${tickets[@]:-}"; do
+  [ -z "$t" ] && continue
+  case "$t" in \#*) norm_tickets+=("$t") ;; *) norm_tickets+=("#$t") ;; esac
+done
+text_tickets=$(printf '%s\n' "$summary" | { grep -oE '#[0-9]+' || true; })
+
+tickets_json=$( { printf '%s\n' "${norm_tickets[@]:-}"; printf '%s\n' "$text_tickets"; } \
+  | { grep -E '^#[0-9]+$' || true; } \
+  | awk '!seen[$0]++' \
+  | jq -R . | jq -sc . )
+[ -n "$tickets_json" ] || tickets_json='[]'
+
+ts=$(date "+%Y-%m-%dT%H:%M:%S%z")
+date_file=$(date "+%Y-%m-%d-%A")
+report_dir="${DAILY_REPORTS_DIR:-$HOME/daily_reports}"
+report_file="${report_dir}/${date_file}.jsonl"
+mkdir -p "$report_dir"
+
+jq -cn \
+  --arg ts "$ts" \
+  --arg project "$project" \
+  --arg summary "$summary" \
+  --argjson tickets "$tickets_json" \
+  '{ts:$ts, source:"manual", tickets:$tickets, summary:$summary}
+   + (if $project == "" then {} else {project:$project} end)' \
+  >> "$report_file"
+
+echo "logged: $summary${project:+  [$project]}"
