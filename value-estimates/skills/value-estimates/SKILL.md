@@ -26,9 +26,9 @@ If neither `--from/--to` nor `--days` is supplied, **always ask the user for a t
 Read two files from `~/daily_reports/meta/`:
 
 - **`projects.yml`** — shared project map. The relevant fields here are `harvest` (official Harvest name), `gitlab` (GitLab project path), and `log_aliases`. Skip entries with `excluded: true`.
-- **`local-context.md`** — per-machine config (currently the daily reports path; defaults to `~/daily_reports/`).
+- **`local-context.md`** — per-machine config: the daily reports path (defaults to `~/daily_reports/`) and the Harvest `user_id` used to scope Step 6.
 
-Also check for **`~/daily_reports/meta/tickets.json`** (the timesheet-skill sidecar). When present, it gives O(1) per-ticket lookups for `harvest_hours`, `harvest_entry_ids`, `first_seen` / `last_seen`, etc. — used in Step 6 below.
+Also check for **`~/daily_reports/meta/tickets.json`** (the timesheet-skill sidecar). When present, it gives O(1) per-ticket lookups for `first_seen` / `last_seen` / `days_active` and `harvest_entry_ids`. It is **not** the source of actual hours (Step 6 scans Harvest notes, which always reflect user-edited hours).
 
 If `projects.yml` is missing, tell the user to create it (see the timesheet skill's `local-context.example.md` for guidance) and stop. If a Harvest project has no `gitlab` mapping, ask once and append the new entry to `projects.yml`.
 
@@ -91,11 +91,11 @@ Apply this priority order:
 
 Harvest is the canonical source of truth for actuals.
 
-**Fast path — sidecar.** If `~/daily_reports/meta/tickets.json` exists, prefer it for tickets that have a `{project_slug}#{ticket}` key matching this run's project + ticket set. Read `harvest_hours` directly per ticket. The timesheet skill writes one Harvest entry per ticket (since the per-ticket placeholder change), so each entry maps cleanly to a single ticket — no even-split required.
+**Primary path — scan Harvest entry notes.** The timesheet skill writes one Harvest entry per (date, Harvest project), with notes sectioned by ticket. Actual hours per ticket are computed by scanning each entry's notes and **splitting the entry's hours evenly across the tickets it references**. This always reflects the user's edited durations. The `tickets.json` sidecar is not used for hours; use it only for `first_seen` / `last_seen` / `days_active` and entry ids if useful.
 
-**Fallback — scan notes.** For tickets not present in the sidecar (older entries created before the sidecar landed, or projects the timesheet skill never touched), fall back to scanning the **notes field** of each Harvest entry for ticket references using the same regex as Step 3.
+**Ticket extraction from notes.** Prefer **ticket header lines** — lines that consist only of `#NNN` tokens (e.g. `#265` or `#487 #489`). When at least one header line is present, only the tickets on header lines count; this stops a bullet that merely mentions another ticket (e.g. "narrow the assertion to the #435 error summary") from stealing hours. When there are no header lines (legacy notes), fall back to any `#NNN` anywhere in the notes, using the same regex as Step 3.
 
-In a single Bash call, fetch all Harvest entries for the matched project across the date range. Use Python (not `jq`) because notes contain literal newlines:
+Scope the fetch with `user_id` using the Harvest `user_id` stored in `local-context.md` (the same one the timesheet skill uses; if unset, stop and ask rather than guessing), so a manager-level token does not count teammates' hours. In a single Bash call, fetch all Harvest entries for the matched project across the date range. Use Python (not `jq`) because notes contain literal newlines:
 
 ```bash
 python3 -c "
@@ -113,10 +113,12 @@ headers = {
 # Resolve the Harvest project ID (search active assignments, fuzzy match handled in caller).
 # Then page through time_entries filtered by project_id and date range.
 PROJECT_ID = '<resolved-id>'
+USER_ID = '<user_id from local-context.md>'  # stored Harvest user_id; scopes reads so a manager token doesn't count teammates' hours
 FROM = '<from>'
 TO = '<to>'
 
 ticket_re = re.compile(r'#(\d+)')
+header_re = re.compile(r'^\s*(?:#\d+\s*)+$')  # a line made only of #NNN tokens
 hours_by_ticket = defaultdict(float)
 unmatched_hours = 0.0
 entries = []
@@ -124,13 +126,18 @@ entries = []
 page = 1
 while True:
     req = urllib.request.Request(
-        f'https://api.harvestapp.com/v2/time_entries?project_id={PROJECT_ID}&from={FROM}&to={TO}&page={page}',
+        f'https://api.harvestapp.com/v2/time_entries?user_id={USER_ID}&project_id={PROJECT_ID}&from={FROM}&to={TO}&page={page}',
         headers=headers)
     with urllib.request.urlopen(req) as resp:
         data = json.loads(resp.read())
     for e in data['time_entries']:
         notes = e.get('notes') or ''
-        ids = set(ticket_re.findall(notes))
+        header_ids = set()
+        for line in notes.splitlines():
+            if header_re.match(line):
+                header_ids.update(ticket_re.findall(line))
+        # Prefer header lines; fall back to any #NNN for legacy notes.
+        ids = header_ids or set(ticket_re.findall(notes))
         if ids:
             # Split this entry's hours evenly across the tickets it mentions.
             share = e['hours'] / len(ids)
@@ -147,7 +154,7 @@ print(json.dumps({'hours_by_ticket': hours_by_ticket, 'unmatched_hours': unmatch
 "
 ```
 
-**Why even-split across mentioned tickets (fallback path only):** legacy Harvest entries (created before the per-ticket placeholder change) may reference multiple tickets in their notes. With no finer-grained signal, split equally and disclose this in the report's methodology footer so the user can interpret variance accordingly. New entries (sidecar path) are 1:1 ticket-to-entry, so this caveat doesn't apply to them.
+**Why even-split:** one Harvest entry covers all of a project's tickets for the day, and there is no finer-grained signal than the entry's hours, so split equally and disclose this in the report's methodology footer so the user can interpret variance accordingly. Legacy entries (one per ticket, or free-form notes) go through the same code path.
 
 `unmatched_hours` (Harvest hours on this project with no ticket reference in the notes) is reported separately so the user can spot under-tagged entries.
 
@@ -188,8 +195,8 @@ Tickets that appeared in daily reports but lack enough spec to estimate. Each en
 ## Methodology
 
 - Estimate sources, in priority order: GitLab `/estimate`, spec-embedded number, spec-derived range, undefined.
-- Actuals pulled from Harvest by parsing ticket IDs from entry notes. Where one entry mentions multiple tickets, hours are split evenly across them.
-- Unmatched hours = Harvest entries on this project whose notes contain no `#<id>` reference.
+- Actuals pulled from Harvest by parsing ticket IDs from entry notes (ticket header lines preferred; any `#<id>` for legacy notes). Each entry's hours are split evenly across the tickets it references, so per-ticket actuals are an even-split approximation when several tickets share an entry.
+- Unmatched hours = Harvest entries on this project whose notes contain no `#<id>` reference (e.g. no-ticket-only entries).
 ```
 
 For ranged estimates, **always use the high end of the range** as the estimate value for the variance calculation. Variance is `actual − high`. This treats the upper bound as the commitment.

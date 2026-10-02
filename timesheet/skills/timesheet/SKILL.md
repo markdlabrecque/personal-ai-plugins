@@ -114,7 +114,7 @@ End with a summary line: e.g., "3 weekdays with < 6 hours out of 22 weekdays in 
 
 ### Overview
 
-The user's daily work log is a **multi-source, append-only** stream of events (`commit`, `session`, and `manual`) captured to `~/daily_reports/{date}.jsonl` (see *How the daily log is captured*). For a given date range this skill: reads the raw events, **enriches and denoises them** (Step 2.5 — drops ignored noise, summarizes Claude sessions, pulls GitLab activity, collapses duplicates), groups the resulting work items by ticket within project per day, matches each to a Harvest project, and creates one Harvest time entry per ticket per project per day — always `0.02h` (≈1 minute) as a placeholder the user adjusts to actuals later, with a combined summary comment covering all the day's work for that ticket. Multiple events on the same ticket on the same day collapse into a single entry; events without a ticket number are grouped together as one no-ticket entry per project per day; events that touch multiple tickets duplicate (full placeholder per ticket — they don't split).
+The user's daily work log is a **multi-source, append-only** stream of events (`commit`, `session`, and `manual`) captured to `~/daily_reports/{date}.jsonl` (see *How the daily log is captured*). For a given date range this skill: reads the raw events, **enriches and denoises them** (Step 2.5 — drops ignored noise, summarizes Claude sessions, pulls GitLab activity, collapses duplicates), resolves each to a Harvest project, and creates **one Harvest time entry per Harvest project per day** — always `0.02h` (≈1 minute) as a placeholder the user adjusts to actuals later, Development task. The entry's notes hold one section per ticket (then a no-ticket section), so a day's work on several tickets in the same project is one row to fill in, not many. Events that touch several tickets appear once, under a combined ticket header. Per-ticket hours downstream are an **even split** of the entry's hours across the tickets in its notes.
 
 ## Credentials
 
@@ -264,21 +264,29 @@ Resolve each item's project hint to a project name (matching is finalized in Ste
 
 1. **The work item's `tickets[]`** (populated by capture or by Enrichment — from a commit subject, a `worklog -t`, a GitLab iid, or a session inference). Authoritative — use it and skip the regex scan. For legacy `.md` entries this is the `**Tickets:**` line.
 2. **Regex scan** of the item's summary bullet(s) for `#NNN` patterns (`#189`, `(#189)`, `ticket #189`). Capture all distinct IDs.
-3. **No reference found.** Prompt the user inline: *"entry on YYYY-MM-DD '<summary>' has no ticket — link one? (enter a `#NNN`, or press enter to leave unlinked)"*. If the user supplies a ticket, treat it as authoritative for this run. If they skip, the entry goes into a no-ticket bucket for that (date, project).
+3. **No reference found.** Prompt the user inline: *"entry on YYYY-MM-DD '<summary>' has no ticket — link one? (enter a `#NNN`, or press enter to leave unlinked)"*. If the user supplies a ticket, treat it as authoritative for this run. If they skip, the item goes in the no-ticket section of that (date, project)'s entry.
 
 Backfilling user-supplied tickets back into the source log is **out of scope** for now — see the Roadmap section. The prompt only collects the ticket for this run.
 
-**Multiple tickets on one item** → duplicate the item into each ticket bucket (do **not** split the placeholder). Each ticket gets its own full-placeholder entry; the same summary bullet(s) appear under every ticket it touched.
+**Multiple tickets on one item** → the item stays a single item carrying all its tickets; it is written **once** in the entry's notes, under a combined header (see below). Do not duplicate its bullets per ticket.
 
-Group all items by (date, project, ticket). Each group becomes a single Harvest time entry. For each group, format the notes as a list — one bullet per summary line, each prefixed with `- ` and a trailing newline. Use the item's summary (trimmed of timestamps, project names, and the leading `#NNN` token) as each bullet. For example, for ticket #265:
+**Grouping key: `(date, resolved Harvest project)`.** Project resolution (Step 4, including multi-project disambiguation, which is asked per `(codebase, ticket)`) happens **before** grouping. Then all items whose project resolves to the same Harvest project on the same date become **one** Harvest entry (`0.02h`, Development task). One codebase can therefore yield two entries on one day if its tickets resolve to different Harvest projects; two codebases billing to the same Harvest project share one entry.
+
+Format the entry's notes as one section per ticket, in ascending ticket order (a combined header such as `#142 #143` sorts by its lowest ticket number among the sections), then a `(no ticket)` section last. Each section is a header line followed by `- ` bullets (the item's summary, trimmed of timestamps, project names, and the leading `#NNN` token). Within a ticket section, collapse multiple commits on that ticket into its bullets. An item tied to several tickets appears once, under a combined header listing them (e.g. `#487 #489`) — no duplicate bullets. Example:
 
 ```
+#265
 - Update site search placeholder to 'Search Island Health'
 - Fix /search clear button position and remove duplicate
-- Migrate search asset_injector CSS into theme custom-overrides.css
+#266
+- Add ih-search:relevance-report drush command
+#487 #489
+- Cross-cutting session-token refactor
+(no ticket)
+- Merge branch '268-synonyms-management-page' into search
 ```
 
-Multiple commits on the same ticket on the same day collapse into one entry. A merge commit or chore-only entry with no ticket reference (and that the user opts not to link) lands in the no-ticket bucket for its project.
+Omit the `(no ticket)` header when the entry has no ticket sections (entry is only no-ticket work → plain bullets, no header). A merge commit or chore-only item with no ticket reference (that the user opts not to link) goes in the no-ticket section.
 
 ### Exclusion rule
 
@@ -299,8 +307,9 @@ From this data:
 4. Identify the **internal project** (the entry with `internal: true` in `projects.yml`) — find its ID in the project list. This is used for two purposes:
    - **Fallback**: any log entry whose project can't be matched gets assigned here.
    - **Daily admin entry**: for every **weekday** (Mon–Fri) being processed, automatically add a 0.02h entry to this project with the **admin task** from `projects.yml` and a blank comment. This entry should always appear in the summary table. Do **not** add an admin entry on weekends (Sat/Sun), even if the user logged work on those days.
+   - The admin entry stays a **separate** entry (internal project, admin task, blank notes). Any Development-task work that resolves to the internal project (including fallback items) is its own Development entry under the same `(date, project)` grouping rule — a different task from admin, so still at most one of each per day.
 
-**Placeholder duration:** every entry created by this skill — per-ticket, no-ticket, and admin — uses `0.02h` (≈1 minute). The user adjusts each entry's duration to actuals later in the Harvest UI. The placeholder is intentionally tiny so untouched entries are obvious.
+**Placeholder duration:** every entry created by this skill — per-project Development entries and the admin entry — uses `0.02h` (≈1 minute). The user adjusts each entry's duration to actuals later in the Harvest UI. The placeholder is intentionally tiny so untouched entries are obvious.
 
 The API paginates at 100 results. If `next_page` is present in the Step 2 project response, fetch subsequent pages in a follow-up call. In practice, most users have fewer than 100 active project assignments.
 
@@ -314,12 +323,11 @@ When a work item resolves to a **multi-project** entry (Step 4.3), prompt the us
 - **Non-interactive run or empty reply** → default to the **first** listed project and record it in the final summary (`defaulted <alias> → <project> (N candidates)`). Never silently guess without surfacing it.
 - **Excluded interplay:** if **every** candidate of a multi-project entry is `excluded: true`, skip the item (silent, like any excluded project). Otherwise disambiguate among the non-excluded candidates only.
 
-Before creating any entries, show the user a summary table:
+After resolving projects (and disambiguation), group items by `(date, Harvest project)` as described in Step 3. Before creating any entries, show the user a summary table with **one row per entry**; the Ticket column lists every ticket in the entry (`(none)` for the no-ticket section):
 
 | Date | Log Project | Harvest Project | Ticket | Hours | Summary |
 |------|------------|-----------------|--------|-------|---------|
-| 2026-03-25 | clientportal/api | Client Portal - API | #142 | 0.02 | - Config cleanup<br>- PHPUnit setup |
-| 2026-03-25 | clientportal/api | Client Portal - API | (none) | 0.02 | - Merge release branch |
+| 2026-03-25 | clientportal/api | Client Portal - API | #142, #143, (none) | 0.02 | #142<br>- Config cleanup<br>- PHPUnit setup<br>#143<br>- Fix token refresh<br>(no ticket)<br>- Merge release branch |
 | 2026-03-25 | (admin) | *(internal project)* | — | 0.02 | |
 
 Ask the user to confirm before proceeding. This matters because fuzzy matching can produce wrong mappings. **Flag any row resolved via project disambiguation** (e.g. a `*` on the Harvest Project cell) and **list any auto-defaulted picks** (non-interactive fallback to the first candidate) just above the table, so a wrong multi-project mapping is easy to catch here.
@@ -328,7 +336,7 @@ Ask the user to confirm before proceeding. This matters because fuzzy matching c
 
 For all confirmed entries, POST them with the bundled `bin/harvest-post` script — **one Bash call, no hand-written POST loop.** The script owns identity verification, the POST loop, HTTP error handling, and the result lines, so a run only has to produce the entry data. The account uses duration-based tracking (not timestamp timers); supplying `hours` without `started_time` does not start a timer (`is_running: false` in the response).
 
-Each entry's `notes` should begin with the ticket reference (`#NNN`) on its own line, followed by the bulleted commit list. This makes per-ticket aggregation in downstream tools (value-estimates, future report skills) reliable. For the no-ticket bucket and the admin entry, omit the leading `#NNN` line.
+Each entry's `notes` use the sectioned format from Step 3: a ticket header line (`#NNN`, or `#NNN #MMM` for an item tied to several tickets) followed by its bullets, one section per ticket, then `(no ticket)` last. Header lines that consist only of `#NNN` tokens are what downstream tools (value-estimates, future report skills) parse for per-ticket aggregation. An entry with only no-ticket work has plain bullets; the admin entry has blank notes.
 
 **Locating the script.** It lives at `bin/harvest-post` inside this plugin — `"$CLAUDE_PLUGIN_ROOT/bin/harvest-post"` when that variable is set. If it isn't, derive it from this skill's own path (`<this SKILL.md>/../../../bin/harvest-post`). Do not copy the script elsewhere and do not reimplement it inline.
 
@@ -339,7 +347,7 @@ source ~/.zshenv && \
 cat > /tmp/harvest-entries.json <<'JSON'
 [
   {"project_id": 111, "task_id": 222, "spent_date": "2026-03-23", "hours": 0.02,
-   "notes": "#142\n- Task one\n- Task two"},
+   "notes": "#142\n- Task one\n- Task two\n#143\n- Task three\n(no ticket)\n- Merge release branch"},
   {"project_id": 111, "task_id": 333, "spent_date": "2026-03-23", "hours": 0.02, "notes": ""}
 ]
 JSON
@@ -383,14 +391,14 @@ Schema — keys are `{project_slug}#{ticket}`, where `project_slug` is the first
 ```
 
 Upsert rules per ticket touched in this run:
-- `title` — set on first sight to the cleaned `###` header of the first entry; never overwritten unless empty.
+- `title` — set on first sight to the first bullet of the ticket's section in the first entry it appears in; never overwritten unless empty.
 - `harvest_project` — the matched Harvest project name.
 - `first_seen` / `last_seen` — min / max of all dates this ticket appears on (across the lifetime of the file, not just this run).
 - `days_active` — count of distinct dates in the union of all dates this ticket has appeared on.
-- `harvest_hours` — sum of `hours` from every linked Harvest entry id (re-derive from Harvest, do not just add this run's hours, so user-edited durations are reflected accurately).
-- `harvest_entry_ids` — append-only set of Harvest entry IDs created for this ticket.
+- `harvest_hours` — sum, over every linked Harvest entry id, of `entry hours / number of distinct tickets referenced in that entry's ticket headers`. This is an **even split**: an entry shared by several tickets contributes an equal share to each (the no-ticket section does not count as a ticket). Ticket counting uses the same extraction rule as value-estimates Step 6 (header lines made only of `#NNN` tokens; if none, any `#NNN` in the notes). Round each ticket's `harvest_hours` to 2 decimals only after summing. Re-derive from Harvest, do not just add this run's hours, so user-edited durations are reflected accurately.
+- `harvest_entry_ids` — append-only set of Harvest entry IDs whose notes include this ticket. Since entries are per-project-per-day, **every ticket in an entry gets that entry's id appended**; one id is therefore shared by all tickets in the entry.
 
-If the file doesn't exist, create it. Read → mutate in memory → write atomically (write to `tickets.json.tmp`, rename). The no-ticket bucket and the admin entry are **not** recorded in the sidecar.
+If the file doesn't exist, create it. Read → mutate in memory → write atomically (write to `tickets.json.tmp`, rename). The no-ticket section and the admin entry are **not** recorded in the sidecar (an entry with only no-ticket work creates no sidecar keys).
 
 The sidecar is also a natural surface for a future `--backsync` mode (see Roadmap) that pulls actual hours from Harvest and writes them back into the daily report markdown.
 
@@ -407,7 +415,7 @@ After all entries are created, show a final summary:
 Known follow-ups, not yet implemented:
 
 - **`**Tickets:**` line backfill.** When the user supplies a ticket via the inline prompt in Step 3, write a `**Tickets:** #NNN` line back into the source markdown so the file becomes self-describing for next time. Out of scope until the parser side is proven.
-- **`--backsync` mode.** Pull every Harvest entry for the past N days and write actual hours back into the matching daily report entry as a `**Hours:**` line, so the daily report mirrors Harvest at any point. Depends on per-ticket entries being stable (already true) and the sidecar (already in place).
+- **`--backsync` mode.** Pull every Harvest entry for the past N days and write actual hours back into the matching daily report entry as a `**Hours:**` line, so the daily report mirrors Harvest at any point. Depends on the per-project-per-day entry shape being stable (already true) and the sidecar (already in place).
 - **Variance persistence.** Extend the sidecar (or add `~/daily_reports/meta/estimates.json`) so each ticket carries `{estimate_hours, estimate_source, actual_hours, variance, computed_at}` over time, giving longitudinal accuracy data instead of point-in-time snapshots.
 
 ## Appendix: Legacy Markdown format

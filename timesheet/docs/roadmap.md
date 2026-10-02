@@ -22,12 +22,12 @@ The timesheet skill should:
 
 ## Problem 2: Harvest entries are placeholder hours, not real durations
 
-**Today.** The timesheet skill creates one 1.0h entry per project per day. The user later edits each entry's duration in the Harvest UI to reflect actual time. That's fine, but per-ticket variance (the headline number in the value-estimates report) only becomes meaningful **after** the user does that pass.
+**Today.** The timesheet skill creates one 0.02h placeholder entry per Harvest project per day, with notes sectioned by ticket. The user later edits each entry's duration in the Harvest UI to reflect actual time. That's fine, but per-ticket variance (the headline number in the value-estimates report) only becomes meaningful **after** the user does that pass.
 
 **Proposal.** Two complementary changes:
 
 1. **Backsync flow.** Add a `--backsync` mode to the timesheet skill that pulls every Harvest entry for the past N days and writes the *actual* hours back into the matching daily report entry as a `**Hours:**` line. This makes the daily report a faithful mirror of Harvest at any point.
-2. **One entry per ticket per day, not one per project per day.** When a daily report entry has a `**Tickets:**` line, create a Harvest entry per ticket with the placeholder duration split evenly (or `0.0h` if Harvest accepts it), and put the ticket ID in the notes. This removes the even-split heuristic in `value-estimates` Step 6 — every Harvest entry then maps to exactly one ticket.
+2. **~~One entry per ticket per day~~ — superseded.** The skill now creates one entry per Harvest project per day (fewer rows to fill in), with ticket header lines in the notes. `value-estimates` splits each entry's hours evenly across the tickets in its notes (header lines preferred).
 
 ## Problem 3: no aggregated ticket log
 
@@ -75,7 +75,7 @@ Both skills read from this file. New skills slot in by reading the same file. Ad
 1. **Tickets sidecar (`~/daily_reports/.tickets.json`)** — biggest single win for value-estimates, no behaviour change to existing timesheet flow.
 2. **`**Tickets:**` line in daily reports** — quick to add to the parser; backfill is optional.
 3. **Shared project map** — mechanical refactor, unblocks future skills.
-4. **Per-ticket Harvest entries** — bigger workflow change; do this only after the sidecar and the Tickets line are in place, and confirm with the user that splitting the placeholder helps more than it hurts.
+4. ~~Per-ticket Harvest entries~~ — superseded by one entry per project per day (see Problem 2).
 5. **Backsync flow** — the most ambitious; depends on (4) being stable.
 
 ## Roadmap items for the `value-estimates` skill itself
