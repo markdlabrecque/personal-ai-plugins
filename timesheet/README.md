@@ -42,7 +42,7 @@ Two parts:
 
 ### 1. The skill (`timesheet`)
 
-Reads daily report markdown files, maps commits and ticket activity to Harvest projects, and creates time entries. Maintains a `~/daily_reports/meta/tickets.json` sidecar with per-ticket Harvest entry IDs and hours.
+Reads daily report markdown files, maps commits and ticket activity to Harvest projects, and creates one 0.02h time entry per Harvest project per day (notes sectioned by ticket). Maintains a `~/daily_reports/meta/tickets.json` sidecar with per-ticket Harvest entry IDs and hours (even split across tickets sharing an entry).
 
 **Flags:**
 
