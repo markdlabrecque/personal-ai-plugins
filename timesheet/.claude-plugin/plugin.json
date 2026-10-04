@@ -1,9 +1,0 @@
-{
-  "name": "timesheet",
-  "version": "0.5.1",
-  "description": "Fill out Harvest timesheets from a multi-source daily log. Captures git commits (PostToolUse hook), Claude sessions (SessionEnd hook), and manual notes (worklog CLI) as JSONL, then enriches and denoises them at timesheet time.",
-  "author": {
-    "name": "Mark Labrecque",
-    "email": "mark@affinitybridge.com"
-  }
-}

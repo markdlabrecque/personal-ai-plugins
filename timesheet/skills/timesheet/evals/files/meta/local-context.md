@@ -1,5 +1,0 @@
-# Fixture local context
-
-```
-.
-```

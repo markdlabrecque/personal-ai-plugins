@@ -6,11 +6,6 @@
   },
   "plugins": [
     {
-      "name": "timesheet",
-      "source": "./timesheet",
-      "description": "Fill out Harvest timesheets from a multi-source daily log. Captures git commits (PostToolUse hook), Claude sessions (SessionEnd hook), and manual notes (worklog CLI) as JSONL, then enriches and denoises them at timesheet time."
-    },
-    {
       "name": "value-estimates",
       "source": "./value-estimates",
       "description": "Generate a value-based estimate report: pull tickets delivered in a date range from daily reports, cross-reference GitLab issues for effort, and compare to Harvest actuals."
