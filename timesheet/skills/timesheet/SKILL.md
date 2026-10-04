@@ -245,9 +245,9 @@ Process events in this order:
 
 **3. Pull GitLab activity (if available).** This catches review/triage work that never produced a local commit. If `glab` is on PATH (and a token is configured), pull the user's activity for the range:
    ```bash
-   glab api "/events?after=START_MINUS_1&before=END_PLUS_1&per_page=100" 2>/dev/null
+   glab api --hostname git.affinitybridge.com "/events?after=START_MINUS_1&before=END_PLUS_1&per_page=100"
    ```
-   Keep only meaningful actions (commented on / approved an MR, opened/closed/merged an MR, opened/closed an issue). For each, derive a work item: project from the event's GitLab project path matched against `projects.yml` `gitlab:`, ticket from the issue/MR iid, summary from the action + title. If `glab` is unavailable or unauthenticated, **skip this and note it in Step 7** ("GitLab activity not pulled — glab unavailable"). Never fail the run over it.
+   Keep only meaningful actions (commented on / approved an MR, opened/closed/merged an MR, opened/closed an issue). For each, derive a work item: project from the event's GitLab project path matched against `projects.yml` `gitlab:`, ticket from the issue/MR iid, summary from the action + title. Always pass `--hostname`: without it, `glab` picks the host from the cwd's git remote and falls back to gitlab.com, which returns `401` from any non-GitLab checkout. If `glab` is unavailable or the call fails (any non-zero exit or error body, e.g. `401 Unauthorized`), **skip this and warn the user prominently in Step 7** with the error text ("⚠ GitLab activity not pulled — <error>"). An empty result is not a failure; an error is. Never fail the run over it.
 
 **4. Merge, dedupe, collapse.** Combine the surviving `commit`, `session`, `manual`, and GitLab items. Collapse everything that refers to the same `(date, resolved-project, ticket)`:
    - A session whose only outcome was commits you already have → folded in (no separate line).
