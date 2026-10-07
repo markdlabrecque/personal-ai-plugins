@@ -2,8 +2,9 @@
 
 ## The workflow
 
-1. **You start it.** Type `/orchestration` and list the tickets you want done.
-2. **It checks the project.** `BASE_BRANCH` is set in `.env`, and there's a local
+1. **You start it.** Open a session in the project root (`~/Projects/<project>`),
+   type `/orchestration` and list the tickets you want done.
+2. **It checks the project.** `BASE_BRANCH` is set in `.orch`, and there's a local
    site to test on (DDEV or a Docker harness). If something's missing, it stops
    and tells you.
 3. **Each ticket gets its own space.** A fresh worktree cut from `BASE_BRANCH`,
@@ -34,6 +35,8 @@ Run coding tickets end to end. A main orchestrator gives each ticket its own wor
 | Path | What |
 |---|---|
 | `skills/orchestration/` | The skill: roles, main orchestrator loop, ticket pipeline, `orch` CLI contract, design notes |
+| `skills/setup-project/`, `skills/create-worktree/`, `skills/retire-worktree/` | Project setup and worktree engines |
+| `scripts/orch-project.sh` | Shared project-root resolver the shell engines source |
 | `agents/` | Stage agents: `test-writer`, `implementor`, `reviewer`, `verifier`, `reporter` (spawned as `orchestration:<name>`; plain `<name>` on Codex) |
 | `scripts/orch` | State CLI, Python 3.9+ standard library only |
 | `scripts/codex-agents` | Writes the stage agents to `~/.codex/agents` for Codex |
@@ -47,14 +50,29 @@ Run coding tickets end to end. A main orchestrator gives each ticket its own wor
 - `python3` 3.9+ and `git`.
 - The harness on `PATH`: `claude`, `pi` (with the `subagents` extension) or `codex`. For Orca or Herdr, their CLI too (`orca`, `herdr`). For Desktop, the main session needs the `start_session` tool.
 - `glab` or `gh` for MRs and CI.
-- The `create-worktree` and `retire-worktree` skills for worktree setup and teardown.
-- A verification environment: DDEV in the project, or a Docker harness command in `.agents/orchestration/config.json` (`verify_harness`). Without one, preflight stops before any ticket starts.
+- The `setup-project`, `create-worktree` and `retire-worktree` skills (bundled) for project setup and worktree setup and teardown.
+- A verification environment: DDEV in the project, or a Docker harness command in `<project root>/.agents/orchestration/config.json` (`verify_harness`). Without one, preflight stops before any ticket starts.
 
 ## Project setup
 
-Add `BASE_BRANCH=<integration branch>` to the main checkout's `.env`. Ticket worktrees are cut from it and MRs squash-merge into it.
+Each project lives in its own folder under `~/Projects` (`ORCH_PROJECTS_DIR` overrides):
 
-Optional: add `ACCESSIBILITY_TESTS=true` to the same `.env` to have the verifier run an automated accessibility scan (axe) on every screen a ticket changes. Missing or any other value means off. Only the main checkout's `.env` counts; worktrees don't have one.
+```
+~/Projects/<project>/        project root: run the orchestrator here
+├── .orch                    project config (KEY=VALUE)
+├── .agents/orchestration/   orch state: state.db, logs/, briefs/, config.json
+└── code/
+    ├── <main checkout>/     DDEV name: <PROJECT_NAME>
+    └── <id>/                ticket worktrees; DDEV name: <id>-<PROJECT_NAME>
+```
+
+1. Make `~/Projects/<project>/code/` and clone the repository into it.
+2. Run the `setup-project` skill from anywhere in the project folder. It writes `.orch` with every default filled in: `PROJECT_NAME` (the folder's name), `MAIN_CHECKOUT`, `WORKTREE_ROOT` (`code`), `BASE_BRANCH` (from `origin/HEAD`) and `ACCESSIBILITY_TESTS=false`.
+3. Check `BASE_BRANCH`. Ticket worktrees are cut from it and MRs squash-merge into it.
+
+Set `ACCESSIBILITY_TESTS=true` in `.orch` to have the verifier run an automated accessibility scan (axe) on every screen a ticket changes. Any other value means off.
+
+Every key resolves the same way: environment variable, then `.orch`, then the default. Relative paths in `.orch` resolve against the project root.
 
 ## Install and invoke
 

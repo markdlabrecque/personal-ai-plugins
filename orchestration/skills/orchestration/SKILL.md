@@ -37,18 +37,18 @@ Stage agents are named per harness: `orchestration:<name>` in Claude Code (the A
 
 A request to start, work on, or resume tickets authorizes this whole loop. Do not re-ask for each step.
 
-1. **Check the main checkout.** Branch and working tree. Surface uncommitted work before starting; preserve it.
-2. **Preflight.** `orch init`, then `orch preflight`. It reports the harness and platform you are running on; every ticket session you start runs there too (see "Platforms" below). Exit 5 is a stop: nothing gets created. Tell the user what failed. A missing `BASE_BRANCH` needs a line in `.env`. No verification environment (no DDEV, no `verify_harness` Docker harness) needs a decision on how verification should run. Ask once, two options max, with a recommendation.
+1. **Check the project.** Run from the project root (`~/Projects/<project>`). If `.orch` is missing, run the `setup-project` skill first. Then check the main checkout (`MAIN_CHECKOUT` in `.orch`): branch and working tree. Surface uncommitted work before starting; preserve it.
+2. **Preflight.** `orch init`, then `orch preflight`. It reports the harness and platform you are running on; every ticket session you start runs there too (see "Platforms" below). Exit 5 is a stop: nothing gets created. Tell the user what failed. A missing `BASE_BRANCH` needs a line in `.orch`. No verification environment (no DDEV, no `verify_harness` Docker harness) needs a decision on how verification should run. Ask once, two options max, with a recommendation.
 3. **Recover first.** `orch stale` lists tickets whose session died. `orch resume <ticket>` each one. The ticket orchestrator picks up from its recorded phase.
 4. **Add tickets.** For each requested ticket: read the ticket, its comments and linked MRs; check dependencies and readiness per the project's `AGENTS.md`; assign it if the project says to; then `orch add <ticket> --title "<title>" --url <url>`.
 5. **Dispatch.** `orch next` returns what fits under `max_workers`. For each:
    1. Create and provision the worktree with the `create-worktree` skill. The worktree name is the ticket id alone (`19`, not `ticket-19`). It is cut from `BASE_BRANCH`.
-   2. Write the brief (template below) to a temp file. Accessibility tests are `on` only when the main checkout's `.env` has `ACCESSIBILITY_TESTS=true` (any case). Missing, or any other value, is `off`. Read that key from the main checkout, never from the worktree: worktrees have no `.env`.
+   2. Write the brief (template below) to a temp file. Accessibility tests are `on` only when `.orch` in the project root has `ACCESSIBILITY_TESTS=true` (any case). Missing, or any other value, is `off`.
    3. `orch spawn <ticket> --worktree <absolute path> --brief-file <file>`. On Desktop, carry out the printed action (below).
    A ticket whose prerequisite is not `done` stays in `ready` until it is.
 6. **Supervise until every ticket is done.** Check `orch list` on a slow cadence (a background wakeup or monitor, not a sleep loop). React by phase and `health`:
    - `done` → `orch retire <ticket>` (on Desktop, carry out its action), then the `retire-worktree` skill for that worktree and its DDEV project. Then dispatch anything newly unblocked.
-   - `dead` and not done (`orch stale`) → `orch resume <ticket>`. If the same ticket dies twice in a row at the same phase, look at why (headless: the tail of `.agents/orchestration/logs/<ticket>.log`; Orca/Herdr/Desktop: the session itself), fix the cause if it is environmental, and resume. Otherwise, report it.
+   - `dead` and not done (`orch stale`) → `orch resume <ticket>`. If the same ticket dies twice in a row at the same phase, look at why (headless: the tail of `<project root>/.agents/orchestration/logs/<ticket>.log`; Orca/Herdr/Desktop: the session itself), fix the cause if it is environmental, and resume. Otherwise, report it.
    - `idle` and not done or blocked → the session finished a turn without finishing the ticket. Headless sessions exit at that point and show `dead`, so they get resumed. On Orca, Herdr or Desktop the session stays open, so send it a message (`orca terminal send`, `herdr agent prompt`, or the Desktop session tool): "Run `orch show <ticket>` and carry on."
    - `stalled` → look at the session. Kill it only if it is truly stuck; it then shows `dead` and gets resumed.
    - `blocked` → read the reason with `orch show`. If it is a permitted stop (see the pipeline reference), ask the user, then `orch resume <ticket> --note "<answer>"`. Resume restores the phase the ticket was blocked from.

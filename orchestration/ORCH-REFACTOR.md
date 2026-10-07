@@ -1,5 +1,7 @@
 # Orchestration refactor: wrapper-folder project layout
 
+Status: implemented in 0.7.0 on `feat/orch-project-root`. Step 10 (migrate one real project by hand) is still open.
+
 ## Proposed layout
 
 ```
@@ -93,7 +95,8 @@ State moves to `<project root>/.agents/orchestration/`, outside any git repo. Th
 - Everything in the folder moves together: `state.db`, `logs/`, `briefs/`, `config.json`.
 - `orch init` no longer writes a `.gitignore`. Nothing there is in git.
 - **Main vs ticket session.** The hook and the Pi extension find the state dir with the project root walk-up, not git. A session whose cwd is inside a ticket worktree (`<WORKTREE_ROOT>/<id>`, matched against `tickets.worktree`) is a ticket orchestrator. Any other cwd in the project root (the root itself, `code/`, the main checkout) is the main orchestrator, and the hook leaves it alone.
-- The hook stays cheap: a path walk-up and a file check, no git call, for cwds outside `~/Projects`.
+- The hook stays cheap: a path walk-up and a file check. It makes one git call only for a cwd outside `~/Projects` (to trace a worktree under an out-of-root `WORKTREE_ROOT` back to its main checkout), as it did before.
+- A ticket row whose worktree is a main checkout (`.git` is a directory) never matches, so a bad row can't turn the main session into a ticket session.
 
 ### New skill: `orchestration:setup-project`
 

@@ -40,9 +40,9 @@ If the project's `AGENTS.md` says merges wait for a human, stop after a green `c
 Your brief names it; `orch preflight` decided it.
 
 - **ddev** → `orchestration:verifier` on the ticket's own DDEV site.
-- **docker** → start the project's `verify_harness` from `.agents/orchestration/config.json`. The verifier runs against it.
+- **docker** → start the project's `verify_harness` from `<project root>/.agents/orchestration/config.json`. The verifier runs against it.
 
-Your brief also says whether accessibility tests are `on` or `off`. Pass that to the verifier as is. Don't look for a `.env` in the worktree to decide it: there isn't one.
+Your brief also says whether accessibility tests are `on` or `off`. Pass that to the verifier as is. Don't look in `.orch` or the worktree to decide it: the brief is the answer.
 
 Verifier findings go through the same fix-now / follow-up triage as review findings, and they count against the same round cap. So do the errors the verifier reports (console, network, page, server log). Every error, whether this ticket caused it or not, is also flagged to the user: in the MR description and the final message. A pre-existing error gets a follow-up ticket.
 

@@ -14,7 +14,7 @@ You are someone who uses or edits this site a few times a week. You're competent
 The orchestrator tells you which environment to use:
 
 - **ddev** → the ticket's own DDEV site. Get the URL from `ddev describe -j`. On Drupal, log in with `ddev drush uli --no-browser`. On WordPress, use `ddev wp user` to find or create a local admin.
-- **docker** → the project's verification harness from `.agents/orchestration/config.json` (`verify_harness`). The orchestrator gives you its URL and login.
+- **docker** → the project's verification harness from `<project root>/.agents/orchestration/config.json` (`verify_harness`). The orchestrator gives you its URL and login.
 
 Use only that local environment. Never a shared dev site, never production, never a password manager.
 

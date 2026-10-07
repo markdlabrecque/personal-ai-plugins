@@ -1,6 +1,6 @@
 ---
 name: create-worktree
-description: Create and provision a Git worktree (plain `git worktree add`, plus DDEV/composer/DB provisioning) from the main checkout .env. Ticket worktrees are created for the `orchestration` plugin's main orchestrator.
+description: Create and provision a Git worktree (plain `git worktree add`, plus DDEV/composer/DB provisioning) in a project folder set up with `.orch`. Ticket worktrees are created for the `orchestration` plugin's main orchestrator.
 ---
 
 # Create a worktree
@@ -19,12 +19,20 @@ and delegates to it. The project layer is always the entry point.
   ${CLAUDE_PLUGIN_ROOT}/skills/create-worktree/scripts/setup-worktree.sh   <- this engine
 ```
 
-A project with **no shim at all** still works with its base configured in `.env`: run this engine directly, or
-point `WORKTREE_ENGINE` at it. `WORKTREE_ROOT` then defaults to
-`$HOME/Projects/worktrees/<main-checkout-basename>`, DDEV project names end
-`-<main-checkout-basename>`, and there is no default database dump (a
-project that wants one sets `DB_DUMP` itself, via its shim or its main
-checkout's `.env`).
+Projects live in `~/Projects/<project>/` (`ORCH_PROJECTS_DIR` overrides),
+with the main checkout cloned by the user into `code/` and `.orch` written by
+the `setup-project` skill. The engine walks up from the current directory to
+the project root, so it runs from anywhere inside it: the root, `code/`, the
+main checkout or a worktree. No `.orch` → it stops and says to run
+`setup-project`.
+
+A project with **no shim at all** works: run this engine directly, or point
+`WORKTREE_ENGINE` at it. Worktrees land in `<WORKTREE_ROOT>/<id>` (default
+`<project root>/code/<id>`). DDEV names are `<id>-<PROJECT_NAME>` for
+worktrees and `<PROJECT_NAME>` for the main checkout, which the engine
+writes once into the main checkout's `.ddev/config.local.yaml` when that has
+no name yet (an existing different name is kept, with a warning). There is
+no default database dump.
 
 ## Running it
 
@@ -57,13 +65,13 @@ name, such as `19`.
 (lowercase letters, digits, hyphens only), and seeds the DDEV project name
 (sanitized/capped separately).
 
-Read `BASE_BRANCH` from the main checkout's `.env` before creating a worktree. If the file or value is missing, stop without creating anything. Pass that value to the engine and use it for rebases and PR/MR targeting. The engine accepts an environment override for callers, but the skill derives that override from `.env`; it never substitutes the checked-out branch or repository default.
+Read `BASE_BRANCH` from `<project root>/.orch` before creating a worktree. If the file or value is missing, stop without creating anything. Use it for rebases and PR/MR targeting. The engine reads the same value itself; it never substitutes the checked-out branch or repository default.
 
 ## The project provision hook
 
 After `git worktree add`, mode 1 provisions through the project's hook if
 it has one. Resolved as: `PROVISION_HOOK` in the environment, then
-`PROVISION_HOOK` in the main checkout's `.env`, then the conventional
+`PROVISION_HOOK` in `.orch`, then the conventional
 `<worktree>/scripts/setup-worktree.sh`, called with `--provision` and cwd
 set to the new worktree. If none of those exists on disk, this engine runs
 its own provisioning directly; a project with no shim is not required to
@@ -103,37 +111,39 @@ this on a new project" below.
 ## Overrides
 
 Every one of these follows the same precedence unless a row says otherwise:
-**environment variable, then the same-named key in the main checkout's
-`.env`, then the convention/default in the last column.**
+**environment variable, then the same-named key in `<project root>/.orch`,
+then the convention/default in the last column.** Relative paths in `.orch`
+resolve against the project root.
 
 | Variable | What it does | Default / convention | Read from |
 |---|---|---|---|
-| `WORKTREE_ENGINE` | Path to this engine, for a project shim (or a direct call) to delegate to. `orch` sets it when it calls a project shim. | `${CLAUDE_PLUGIN_ROOT}/skills/create-worktree/scripts/setup-worktree.sh` | environment only (a shim sets this itself; `.env` is not consulted) |
-| `BASE_BRANCH` | Branch new worktrees are cut from. | Skill reads main checkout `.env` and passes that value; missing value refuses creation | main checkout `.env`; passed to engine via environment |
-| `DB_DUMP` | Database dump to import during provisioning, either mode. Relative paths resolve against the main checkout. | none — no import happens without one. A project that wants a default sets `DB_DUMP` in its shim (which reaches `--provision` too) | environment, then `.env` |
-| `WORKTREE_ROOT` | Where worktrees live on disk. | `$HOME/Projects/worktrees/<main-checkout-basename>` | environment, `.env` |
-| `PROVISION_HOOK` | Path to a project's own provisioning script, run instead of this engine's own mode-1 provisioning. | conventional `<worktree>/scripts/setup-worktree.sh --provision` | environment, `.env`, convention |
-| `RETIRE_HOOK` | Teardown counterpart of `PROVISION_HOOK`; see `retire-worktree/SKILL.md`. | conventional `<worktree>/scripts/retire-worktree.sh` | environment, `.env`, convention |
+| `WORKTREE_ENGINE` | Path to this engine, for a project shim (or a direct call) to delegate to. `orch` sets it when it calls a project shim. | `${CLAUDE_PLUGIN_ROOT}/skills/create-worktree/scripts/setup-worktree.sh` | environment only (a shim sets this itself; `.orch` is not consulted) |
+| `PROJECT_NAME` | DDEV names: `<PROJECT_NAME>` for the main checkout, `<id>-<PROJECT_NAME>` for worktrees. Sanitized (lowercase, `a-z0-9-`), never cut. | the project root's folder name | environment, `.orch` |
+| `MAIN_CHECKOUT` | The main checkout. | the one folder in `WORKTREE_ROOT` whose `.git` is a directory | environment, `.orch` |
+| `BASE_BRANCH` | Branch new worktrees are cut from. | none; missing value refuses creation | environment, `.orch` |
+| `DB_DUMP` | Database dump to import during provisioning, either mode. Relative paths resolve against the project root. | none — no import happens without one. A project that wants a default sets `DB_DUMP` in `.orch` | environment, then `.orch` |
+| `WORKTREE_ROOT` | Where worktrees live on disk. | `<project root>/code` | environment, `.orch` |
+| `PROVISION_HOOK` | Path to a project's own provisioning script, run instead of this engine's own mode-1 provisioning. | conventional `<worktree>/scripts/setup-worktree.sh --provision` | environment, `.orch`, convention |
+| `RETIRE_HOOK` | Teardown counterpart of `PROVISION_HOOK`; see `retire-worktree/SKILL.md`. | conventional `<worktree>/scripts/retire-worktree.sh` | environment, `.orch`, convention |
 
-All also documented at the top of `scripts/setup-worktree.sh`.
+All also documented at the top of `scripts/setup-worktree.sh`. The lookup itself lives in `scripts/orch-project.sh` at the plugin root, shared with the retire and reap engines and `setup-project` (`ORCH_PROJECT_LIB` overrides its path, for tests).
 
 ## Conventions without a project shim
 
-No project shim is required. Worktree creation still requires `BASE_BRANCH` in the main checkout's `.env`:
+No project shim is required. Worktree creation still requires `BASE_BRANCH` (in `.orch` or the environment):
 
 - **Provision hook**: `<worktree>/scripts/setup-worktree.sh --provision`, run
   with cwd set to the new worktree, whenever `PROVISION_HOOK` doesn't
   resolve to something else first.
 - **Retire hook**: `<worktree>/scripts/retire-worktree.sh` (see
   `retire-worktree/SKILL.md`), the same shape on the teardown side.
-- **`.env` keys this engine reads**, all in the main checkout's `.env`,
-  read only when the matching environment variable is unset:
-  `BASE_BRANCH`, `DB_DUMP`, `WORKTREE_ROOT`, `PROVISION_HOOK`,
-  `RETIRE_HOOK`.
+- **`.orch` keys this engine reads**, each only when the matching
+  environment variable is unset: `PROJECT_NAME`, `MAIN_CHECKOUT`,
+  `BASE_BRANCH`, `DB_DUMP`, `WORKTREE_ROOT`, `PROVISION_HOOK`.
 
 ## Adopting this on a new project
 
-1. **No shim needed for a plain repository.** Set `BASE_BRANCH` in the main checkout's `.env`. A project
+1. **No shim needed for a plain repository.** Run `setup-project` and check `BASE_BRANCH` in `.orch`. A project
    with no `.ddev/`, no `composer.json`, and no `scripts/githooks`
    works without a provision hook: point a caller (or `WORKTREE_ENGINE`)
    straight at this engine, and worktree creation, DDEV-leg skipping, and

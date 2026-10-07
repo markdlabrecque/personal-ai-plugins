@@ -6,15 +6,16 @@
 
 ## Where state lives
 
-State lives in the **main checkout** under `.agents/orchestration/`, resolved from any worktree via `git rev-parse --git-common-dir` (its parent is the main checkout). `ORCH_HOME` overrides the directory (used by tests).
+State lives in the **project root** under `.agents/orchestration/`, outside any git repository. The project root is the folder directly under `ORCH_PROJECTS_DIR` (default `~/Projects`) that holds the cwd, so `orch` runs from the project root, the main checkout or any worktree. A worktree outside the project root is traced through its main checkout (`git rev-parse --git-common-dir`). `ORCH_HOME` overrides the directory (used by tests).
 
-| Path | Git | Holds |
-|---|---|---|
-| `state.db` (+ `-wal`, `-shm`) | ignored | SQLite store: tickets and the append-only event log |
-| `logs/<ticket>.log` | ignored | Output of headless ticket sessions (appended across attempts) |
-| `briefs/<ticket>.md`, `briefs/<ticket>.resume.md` | ignored | Prompt given to the session by `spawn` / `resume` |
-| `config.json` | tracked, optional | Project settings (below) |
-| `.gitignore` | tracked | Written by `orch init`: `state.db*`, `logs/` and `briefs/` |
+The project root also holds `.orch` (written by the `setup-project` skill). `orch` reads `BASE_BRANCH` and `MAIN_CHECKOUT` from it: environment first, then `.orch`. Without `MAIN_CHECKOUT`, the main checkout is the one folder in `WORKTREE_ROOT` (default `code`) whose `.git` is a directory.
+
+| Path | Holds |
+|---|---|
+| `state.db` (+ `-wal`, `-shm`) | SQLite store: tickets and the append-only event log |
+| `logs/<ticket>.log` | Output of headless ticket sessions (appended across attempts) |
+| `briefs/<ticket>.md`, `briefs/<ticket>.resume.md` | Prompt given to the session by `spawn` / `resume` |
+| `config.json` | Optional project settings (below) |
 
 SQLite runs in WAL mode with a busy timeout. Every command is one transaction, so a killed process leaves either the old state or the new one, never half. Writes take `BEGIN IMMEDIATE`; read-only commands (`list`, `show`, `next`, `stale`, `events`, `platform`, `watch`) use a plain deferred read. `spawn`, `resume` and `retire` are the exception: they never hold the write lock while a platform command or worktree engine runs, and hold the ticket's in-flight marker instead (see "Launching sessions"). Older databases gain new columns automatically on first use.
 
@@ -126,9 +127,9 @@ A pid reused by an unrelated process is therefore not alive: `stale` lists the t
 
 The plugin ships `hooks/hooks.json`, which runs `orch hook` on `SessionStart`, `PostToolUse`, `Stop` and `SessionEnd` in **every** session where the plugin is enabled. `orch hook` reads the hook's JSON from stdin (`session_id`, `cwd`, `hook_event_name`, `source`, `reason`).
 
-It must never disturb a session: it always exits 0, prints nothing except on `SessionStart` for a matched ticket, catches every error, and returns at once when there is no `.agents/orchestration/state.db` for `cwd`. It matches under a plain read and takes the write lock (`BEGIN IMMEDIATE`) only when it is about to write, re-checking the ticket under the lock.
+It must never disturb a session: it always exits 0, prints nothing except on `SessionStart` for a matched ticket, catches every error, and returns at once when there is no `<project root>/.agents/orchestration/state.db` for `cwd`. It matches under a plain read and takes the write lock (`BEGIN IMMEDIATE`) only when it is about to write, re-checking the ticket under the lock.
 
-**Matching.** The hook belongs to the non-retired ticket whose worktree (realpath) equals `cwd` or contains it. No match → do nothing. The main checkout is never a ticket worktree: when `git rev-parse --show-toplevel` of `cwd` is the main checkout, the hook does nothing. Then:
+**Matching.** The hook belongs to the non-retired ticket whose worktree (realpath) equals `cwd` or contains it. No match → do nothing, so the main orchestrator (in the project root or the main checkout) is never matched. A row whose worktree is a main checkout (its `.git` is a directory) never matches either. Then:
 
 - `SessionStart` on a `done` ticket writes and prints nothing.
 - `SessionStart` from a session id other than the recorded one takes the ticket over (logged as an `attach` event) only when the recorded session is not alive, or the hook's Claude process is the recorded pid (`/clear` starts a new session id in the same process). Otherwise it is ignored entirely and prints nothing, so a second session opened in the worktree cannot hijack a live ticket session.
@@ -182,9 +183,9 @@ Every command accepts `--json` (one JSON object on stdout). Exit codes: `0` ok, 
 
 | Command | Who | Effect |
 |---|---|---|
-| `orch init` | main | Create the directory, `.gitignore` and database. Safe to re-run. |
+| `orch init` | main | Create the directory and database. Safe to re-run. |
 | `orch platform` | any | `{"platform": ...}` per "Platforms", and `harness`, `harness_source` per "Harnesses". |
-| `orch preflight` | main | Exit 0 and print `verify_env` (`ddev` or `docker`), `base_branch` and `platform`. Exit 5 listing every failure. Checks: `BASE_BRANCH` set in the main checkout's `.env` (only that key is read; an optional `export ` prefix is allowed; a quoted value is the text inside the quotes, an unquoted value ends at the first whitespace-then-`#` comment); verification environment is `ddev` when the main checkout has `.ddev/config.yaml` **and** `ddev` is on `PATH`, else `docker` when `config.json` has `verify_harness` **and** `docker` is on `PATH`, else failure; the platform's binary (`orca` or `herdr`) is on `PATH` when the platform needs one. |
+| `orch preflight` | main | Exit 0 and print `verify_env` (`ddev` or `docker`), `base_branch` and `platform`. Exit 5 listing every failure. Checks: `BASE_BRANCH` set in the environment or `.orch` (an optional `export ` prefix is allowed; a quoted value is the text inside the quotes, an unquoted value ends at the first whitespace-then-`#` comment); verification environment is `ddev` when the main checkout has `.ddev/config.yaml` **and** `ddev` is on `PATH`, else `docker` when `config.json` has `verify_harness` **and** `docker` is on `PATH`, else failure; the platform's binary (`orca` or `herdr`) is on `PATH` when the platform needs one. |
 | `orch add <ticket> --title T [--url U]` | main | New ticket in `ready`. Exit 3 if it exists. Exit 2 unless the id matches `^[A-Za-z0-9][A-Za-z0-9._-]*$` with no `..` (it names files under `logs/` and `briefs/`). |
 | `orch list` | any | All tickets: id, phase, status, platform, health, activity, last_seen_at, review_rounds, pid, alive, retired. |
 | `orch show <ticket>` | any | One ticket in full, including `alive`, `health` and `launch_ref`. |

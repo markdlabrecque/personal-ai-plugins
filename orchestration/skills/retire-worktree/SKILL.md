@@ -17,8 +17,13 @@ scripts/retire-worktree.sh <id> [--force] [--ddev-only]
 scripts/reap-worktrees.sh [--dry-run]
 ```
 
+Both run from anywhere inside the project root (`~/Projects/<project>`),
+including the worktree being retired: they find the project root and the
+main checkout the same way `create-worktree` does (`.orch`, see its
+SKILL.md), then step out to the project root before removing anything.
+
 `retire-worktree.sh` finds the worktree through `git worktree list`: `<id>` must
-be the directory name of a linked worktree of the current repo, wherever it
+be the directory name of a linked worktree of the main checkout, wherever it
 lives on disk. `WORKTREE_ROOT` is not used by it (only by `reap-worktrees.sh`).
 
 Tears down one worktree completely: the Herdr workspace, the DDEV project
@@ -55,13 +60,15 @@ and says so — expected and harmless.
    says to re-run `retire-worktree.sh` once the removal failure is fixed. A
    different or unset `$HERDR_WORKSPACE_ID` closes in step 3 as normal.
 4. Delete the DDEV project — or, if a `RETIRE_HOOK` resolves (env, then
-   the main checkout's `.env`, then the conventional
+   `.orch`, then the conventional
    `<worktree>/scripts/retire-worktree.sh`), delegate this step to it
    instead. The hook runs with cwd set to the still-existing worktree,
    before it is removed, with `RETIRE_WORKTREE_IN_HOOK=1` exported into its
    environment. A project with no retire hook anywhere is not required to
    have one — the engine's own step 4 runs unchanged. It is best-effort: a
-   ddev failure warns on stderr but never aborts the git teardown.
+   ddev failure warns on stderr but never aborts the git teardown. A
+   worktree whose DDEV name is `<PROJECT_NAME>` (the main checkout's
+   project) is never deleted: the engine warns and skips the delete.
 
    The conventional `<worktree>/scripts/retire-worktree.sh` hook is often a
    thin delegate shim that `exec`s straight back into this same engine. The
@@ -108,8 +115,9 @@ whether each branch has landed on `$REMOTE/$BASE_BRANCH` (ancestor,
 patch-equivalent/rebase, or squash — three tiers), and hands anything landed
 to the sibling `retire-worktree.sh` (without `--force`, so a dirty worktree
 survives and is reported as skipped). `--dry-run` prints what would be
-retired without calling it. `BASE_BRANCH` is resolved environment, then the
-main checkout's `.env`, then refuses (no literal default — see the overrides
+retired without calling it. The main checkout, which sits in `WORKTREE_ROOT`
+by default, is skipped by real-path comparison. `BASE_BRANCH` is resolved
+environment, then `.orch`, then refuses (no literal default — see the overrides
 table); `REMOTE` defaults to `origin`.
 
 Every step is destructive and none of it is recoverable. Stop and ask the
@@ -131,15 +139,15 @@ read `RETIRE_ENGINE`.
 
 ## Overrides
 
-Same precedence rule as `create-worktree`: **environment, then the main
-checkout's `.env`, then the convention/default.**
+Same precedence rule as `create-worktree`: **environment, then
+`<project root>/.orch`, then the convention/default.**
 
 | Variable | What it does | Default / convention | Read from |
 |---|---|---|---|
-| `WORKTREE_ROOT` | Where worktrees live on disk — must agree with `create-worktree`'s value for the same project. | `$HOME/Projects/worktrees/<main-checkout-basename>` | environment, `.env` |
-| `RETIRE_HOOK` | Project's own teardown script, replacing this engine's own DDEV-delete step (4) if it exits 0. A nonzero exit (e.g. a delegate shim re-entering this engine, which refuses with exit 3) falls back to the engine's own step 4. The Herdr close (step 3) and git-level teardown (step 5) always stay with the engine. | conventional `<worktree>/scripts/retire-worktree.sh` | environment, `.env`, convention |
+| `WORKTREE_ROOT` | Where worktrees live on disk — must agree with `create-worktree`'s value for the same project. | `<project root>/code` | environment, `.orch` |
+| `RETIRE_HOOK` | Project's own teardown script, replacing this engine's own DDEV-delete step (4) if it exits 0. A nonzero exit (e.g. a delegate shim re-entering this engine, which refuses with exit 3) falls back to the engine's own step 4. The Herdr close (step 3) and git-level teardown (step 5) always stay with the engine. | conventional `<worktree>/scripts/retire-worktree.sh` | environment, `.orch`, convention |
 | `RETIRE_WORKTREE_IN_HOOK` | Set to `1` by the engine itself when invoking a resolved retire hook; not meant to be set by callers. If already set when the engine starts, it refuses immediately (exit 3) — this is what makes re-entry via a delegate-shim hook safe. | unset | environment (engine-internal) |
-| `BASE_BRANCH` (`reap-worktrees.sh` only) | Branch checked for "has this landed". | **No fallback default** — env, then `.env`; refuses (non-zero, reaps nothing) if neither resolves | environment, `.env` |
+| `BASE_BRANCH` (`reap-worktrees.sh` only) | Branch checked for "has this landed". | **No fallback default** — env, then `.orch`; refuses (non-zero, reaps nothing) if neither resolves | environment, `.orch` |
 | `REMOTE` (`reap-worktrees.sh` only) | Remote checked for "has this landed". | `origin` | environment only |
 
 ## Conventions (no configuration required)
@@ -154,9 +162,9 @@ checkout's `.env`, then the convention/default.**
 
 ## Adopting this on a new project
 
-1. **Nothing to create, if the project needs no config.** `WORKTREE_ROOT`
-   defaults to match `create-worktree`'s own default (main-checkout
-   basename), so the two engines agree with zero setup on either side.
+1. **Nothing to create beyond `.orch`.** Both engines read the same `.orch`
+   (written by `setup-project`), so they agree on `WORKTREE_ROOT` and
+   `PROJECT_NAME` with no extra setup.
 2. **Add a shim only for project-specific teardown** — a `RETIRE_HOOK`, or
    anything else that varies per project. Otherwise call the global engine
    directly.

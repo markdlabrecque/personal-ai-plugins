@@ -8,7 +8,7 @@ The script layer (`orch`) is the deterministic code that holds ticket state and 
 
 - **In scope:** the main orchestrator loop, the per-ticket orchestrator, durable state, phase gates, spawning and resuming sessions, recovery.
 - **Out of scope:** ticket ordering and surface-area grouping (another plugin sorts tickets so their touch points stay contained), file locks, and verification-gate tooling such as no-mistakes.
-- **Constraints:** personal use, macOS and Linux, one instance per project, state under `.agents/orchestration` in the main checkout.
+- **Constraints:** personal use, macOS and Linux, one instance per project, state under `.agents/orchestration` in the project root (`~/Projects/<project>`), outside git.
 
 ## Design principles
 
@@ -37,7 +37,7 @@ The main orchestrator does traffic control: preflight, add, dispatch, resume, re
 | Topic | Decision | Why |
 |---|---|---|
 | Script language | Python 3.9+, stdlib only | Built-in SQLite transactions, the same behaviour on macOS and Linux (no BSD/GNU drift), solid process control, testable |
-| State store | SQLite (WAL) in `.agents/orchestration/state.db`, git-ignored | One transaction per command, so a kill leaves old or new state, never half |
+| State store | SQLite (WAL) in `<project root>/.agents/orchestration/state.db`, outside git | One transaction per command, so a kill leaves old or new state, never half |
 | Platforms | `headless`, `orca`, `herdr`, `desktop`. The main orchestrator's platform hosts its ticket sessions; a ticket keeps its platform while its session lives | One clear owner per run; you watch tickets where you already work |
 | Session launch | `orch spawn` starts the session on the platform with a fixed `--session-id`; on Desktop it hands the main orchestrator an action instead, because only an agent can open a Desktop session | The session id is known before the session starts, so `orch` can match and `--resume` it |
 | Monitoring | Plugin hooks (`SessionStart`, `PostToolUse`, `Stop`, `SessionEnd`) report each session to `orch`; liveness checks the reported pid and its start time | `orch` watches sessions it didn't start, on every platform, and a reused pid is never mistaken for a live session |
