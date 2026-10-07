@@ -93,13 +93,17 @@ def read_file(path):
 
 
 class OrchTestCase(unittest.TestCase):
-    """Each test gets its own git repo acting as the main checkout."""
+    """Each test gets its own project root (tmp/Projects/proj, with .orch)
+    and a git repo at code/main acting as the main checkout."""
 
     def setUp(self):
         self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="orch-test-"))
-        self.repo = os.path.join(self.tmp, "main")
+        self.projects = os.path.join(self.tmp, "Projects")
+        self.root = os.path.join(self.projects, "proj")
+        self.repo = os.path.join(self.root, "code", "main")
         os.makedirs(self.repo)
-        self.state_dir = os.path.join(self.repo, ".agents", "orchestration")
+        self.write_orch("")
+        self.state_dir = os.path.join(self.root, ".agents", "orchestration")
         self.record = os.path.join(self.tmp, "claude-calls.jsonl")
         self._fake_count = 0
 
@@ -112,6 +116,7 @@ class OrchTestCase(unittest.TestCase):
         }
         self.env.update(
             {
+                "ORCH_PROJECTS_DIR": self.projects,
                 "GIT_AUTHOR_NAME": "Test",
                 "GIT_AUTHOR_EMAIL": "test@example.com",
                 "GIT_COMMITTER_NAME": "Test",
@@ -178,6 +183,10 @@ class OrchTestCase(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     # ---- helpers ---------------------------------------------------------
+
+    def write_orch(self, text):
+        with open(os.path.join(self.root, ".orch"), "w") as f:
+            f.write("MAIN_CHECKOUT=code/main\n" + text)
 
     def git(self, *args, cwd=None):
         subprocess.run(
@@ -355,24 +364,26 @@ class OrchTestCase(unittest.TestCase):
 
 
 class InitTests(OrchTestCase):
-    def test_init_creates_state_and_gitignore(self):
+    def test_init_creates_state_in_project_root(self):
         self.init()
         self.assertTrue(os.path.exists(os.path.join(self.state_dir, "state.db")))
-        with open(os.path.join(self.state_dir, ".gitignore")) as f:
-            lines = [l.strip() for l in f.read().splitlines()]
-        self.assertIn("state.db*", lines)
-        self.assertIn("logs/", lines)
-        self.assertIn("briefs/", lines)
+        self.assertFalse(os.path.exists(os.path.join(self.repo, ".agents")))
 
     def test_init_is_idempotent_and_keeps_data(self):
         self.init()
         self.add("T-1")
         self.init()
-        with open(os.path.join(self.state_dir, ".gitignore")) as f:
-            lines = [l.strip() for l in f.read().splitlines()]
-        self.assertEqual(lines.count("state.db*"), 1)
-        self.assertEqual(lines.count("logs/"), 1)
         self.assertEqual(self.show("T-1")["phase"], "ready")
+
+    def test_runs_from_project_root(self):
+        self.init()
+        self.ok("add", "T-2", "--title", "from root", cwd=self.root)
+        self.assertIn("T-2", [ticket_id(t) for t in self.tickets("list")])
+
+    def test_outside_project_root_refused(self):
+        p = self.orch("init", cwd=self.tmp)
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("not inside a project folder", p.stderr)
 
     def test_orch_home_override(self):
         home = os.path.join(self.tmp, "custom-home")
@@ -417,8 +428,7 @@ class PreflightTests(OrchTestCase):
         os.chmod(p, 0o755)
 
     def write_env(self, text):
-        with open(os.path.join(self.repo, ".env"), "w") as f:
-            f.write(text)
+        self.write_orch(text)
 
     def ddev_project(self):
         os.makedirs(os.path.join(self.repo, ".ddev"))

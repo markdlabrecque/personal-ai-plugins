@@ -7,9 +7,9 @@ Interpretations the tests rely on (the spec leaves these open):
 - `ORCH_CREATE_ENGINE` / `ORCH_RETIRE_ENGINE` override the path of the bundled
   `create-worktree` / `retire-worktree` engine scripts. Tests use fake engines
   that create/remove a real `git worktree` and record argv, cwd and env.
-- Engines run with cwd = the main checkout (the real engines resolve the repo
-  with `git rev-parse --show-toplevel`). `BASE_BRANCH` from the main
-  checkout's `.env` is passed in their environment, and `WORKTREE_ROOT` from
+- Engines run with cwd = the main checkout (the real engines resolve the
+  project root from it). `BASE_BRANCH` from `.orch` is passed in their
+  environment, and `WORKTREE_ROOT` from
   orch's environment reaches them, so an engine-made worktree lives at
   `$WORKTREE_ROOT/<ticket>`.
 - `retire-worktree.sh` is called with the worktree's directory name (= the
@@ -326,7 +326,7 @@ def load_orch_module():
 
 class AdapterTestCase(PlatformTestCase):
     """PlatformTestCase plus: an isolated machine config dir, BASE_BRANCH in
-    the main checkout's .env, a WORKTREE_ROOT under tmp, fake engines, and
+    .orch, a WORKTREE_ROOT under tmp, fake engines, and
     ORCH_PLATFORM=headless unless a test changes it."""
 
     def setUp(self):
@@ -337,8 +337,7 @@ class AdapterTestCase(PlatformTestCase):
         self.env["ORCH_PLATFORM"] = "headless"
         self.wts = os.path.join(self.tmp, "wts")
         self.env["WORKTREE_ROOT"] = self.wts
-        with open(os.path.join(self.repo, ".env"), "w") as f:
-            f.write("BASE_BRANCH=main\n")
+        self.write_orch("BASE_BRANCH=main\n")
         self.order = os.path.join(self.tmp, "order.jsonl")
         self.env["ORCH_CREATE_ENGINE"] = self.fake_engine("create")
         self.env["ORCH_RETIRE_ENGINE"] = self.fake_engine("retire")

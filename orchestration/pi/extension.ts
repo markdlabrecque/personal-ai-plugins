@@ -2,8 +2,8 @@
 // agents/ directory do for Claude Code:
 //
 // 1. Reports the session to `orch hook` (SessionStart, PostToolUse, Stop,
-//    SessionEnd) so orch knows each ticket session's health. Only in a git
-//    checkout whose main checkout has .agents/orchestration/state.db.
+//    SessionEnd) so orch knows each ticket session's health. Only inside a
+//    project root (~/Projects/<project>) that has .agents/orchestration/state.db.
 // 2. Offers the stage agents (agents/*.md) to the `subagents` extension as
 //    `orchestration:<name>` profiles, translated to Pi tools, model and
 //    thinking.
@@ -12,6 +12,7 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -69,16 +70,42 @@ export function runHook(payload: Payload, timeoutMs = HOOK_TIMEOUT_MS, orch = OR
 	});
 }
 
-/** Whether `cwd` belongs to a repo orch keeps state for (cheap: one git call). */
-export function hasOrchState(cwd: string): boolean {
-	if (process.env.ORCH_HOME) return true;
+/** The project root (the folder directly under ORCH_PROJECTS_DIR, default
+ * ~/Projects) holding `cwd`. A worktree outside it is traced through its main
+ * checkout with one git call. Mirrors scripts/orch's project_root. */
+export function projectRoot(cwd: string): string | null {
+	let projects: string;
+	try {
+		projects = fs.realpathSync(process.env.ORCH_PROJECTS_DIR || path.join(os.homedir(), "Projects"));
+	} catch {
+		return null;
+	}
+	const under = (p: string): string | null => {
+		let real: string;
+		try {
+			real = fs.realpathSync(p);
+		} catch {
+			return null;
+		}
+		const rel = path.relative(projects, real);
+		if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) return null;
+		return path.join(projects, rel.split(path.sep)[0]);
+	};
+	const root = under(cwd);
+	if (root) return root;
 	const p = spawnSync("git", ["-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"], {
 		encoding: "utf8",
 		timeout: 5_000,
 	});
-	if (p.status !== 0 || !p.stdout.trim()) return false;
-	const main = path.dirname(p.stdout.trim());
-	return fs.existsSync(path.join(main, ".agents", "orchestration", "state.db"));
+	if (p.status !== 0 || !p.stdout.trim()) return null;
+	return under(path.dirname(p.stdout.trim()));
+}
+
+/** Whether `cwd` belongs to a project orch keeps state for. */
+export function hasOrchState(cwd: string): boolean {
+	if (process.env.ORCH_HOME) return true;
+	const root = projectRoot(cwd);
+	return !!root && fs.existsSync(path.join(root, ".agents", "orchestration", "state.db"));
 }
 
 // ---- stage agents -----------------------------------------------------------

@@ -168,27 +168,119 @@ def now():
 
 # ---- locations ------------------------------------------------------------
 
-def main_checkout():
-    p = subprocess.run(
-        ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
-        capture_output=True, text=True,
-    )
-    if p.returncode != 0:
-        p = subprocess.run(["git", "rev-parse", "--git-common-dir"],
-                           capture_output=True, text=True)
-    if p.returncode != 0:
-        raise Refusal(1, "not inside a git repository: " + p.stderr.strip())
+# A project lives in $ORCH_PROJECTS_DIR/<project> (default ~/Projects):
+# .orch (KEY=VALUE config), .agents/orchestration (state) and code/ (the main
+# checkout and the ticket worktrees). Config keys resolve: environment, then
+# .orch, then the default. Mirrors scripts/orch-project.sh.
+
+def projects_dir():
+    return os.path.realpath(os.environ.get("ORCH_PROJECTS_DIR")
+                            or os.path.expanduser("~/Projects"))
+
+
+def _root_under(path, projects):
+    rel = os.path.relpath(os.path.realpath(path), projects)
+    if rel in (".", "..") or rel.startswith(".." + os.sep):
+        return None
+    return os.path.join(projects, rel.split(os.sep)[0])
+
+
+def git_common_parent(path):
+    """The main checkout of the repo at `path`, or None."""
+    p = subprocess.run(["git", "-C", path, "rev-parse", "--path-format=absolute",
+                        "--git-common-dir"], capture_output=True, text=True, timeout=5)
+    if p.returncode != 0 or not p.stdout.strip():
+        return None
     common = p.stdout.strip()
     if not os.path.isabs(common):
-        common = os.path.join(os.getcwd(), common)
+        common = os.path.join(path, common)
     return os.path.dirname(os.path.realpath(common))
+
+
+def project_root(start=None):
+    """The folder directly under the projects folder that holds `start`
+    (default the cwd). A worktree outside it is traced through its main
+    checkout."""
+    start = os.path.realpath(start or os.getcwd())
+    projects = projects_dir()
+    root = _root_under(start, projects)
+    if root is None:
+        main = git_common_parent(start)
+        root = main and _root_under(main, projects)
+    if not root:
+        raise Refusal(1, "%s is not inside a project folder (%s/<project-name>)"
+                      % (start, projects))
+    return root
+
+
+def read_orch(root):
+    """KEY=VALUE pairs of <root>/.orch; the last of a key wins."""
+    values = {}
+    try:
+        f = open(os.path.join(root, ".orch"))
+    except OSError:
+        return values
+    with f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].lstrip()
+            key, sep, val = line.partition("=")
+            if not sep:
+                continue
+            val = val.strip()
+            if val[:1] in ("'", '"'):
+                end = val.find(val[0], 1)
+                val = val[1:end] if end != -1 else val[1:]
+            else:
+                val = re.split(r"\s#", val, maxsplit=1)[0].strip()
+            values[key.strip()] = val
+    return values
+
+
+def orch_get(root, key):
+    return os.environ.get(key) or read_orch(root).get(key) or None
+
+
+def orch_path(root, path):
+    return path if os.path.isabs(path) else os.path.join(root, path)
+
+
+def main_checkout():
+    root = project_root()
+    if not os.path.isfile(os.path.join(root, ".orch")):
+        raise Refusal(1, "%s not found; run the orchestration:setup-project skill first"
+                      % os.path.join(root, ".orch"))
+    named = orch_get(root, "MAIN_CHECKOUT")
+    if named:
+        path = os.path.realpath(orch_path(root, named))
+        if not os.path.isdir(path):
+            raise Refusal(1, "MAIN_CHECKOUT %s does not exist" % path)
+        return path
+    wt_root = orch_path(root, orch_get(root, "WORKTREE_ROOT") or "code")
+    found = sorted(os.path.join(wt_root, d) for d in
+                   (os.listdir(wt_root) if os.path.isdir(wt_root) else [])
+                   if os.path.isdir(os.path.join(wt_root, d, ".git")))
+    if len(found) != 1:
+        raise Refusal(1, "%s git checkouts in %s; set MAIN_CHECKOUT in %s"
+                      % ("no" if not found else "several", wt_root,
+                         os.path.join(root, ".orch")))
+    return os.path.realpath(found[0])
+
+
+def base_branch():
+    """(BASE_BRANCH or None, the .orch it should be set in)."""
+    root = project_root()
+    return orch_get(root, "BASE_BRANCH"), os.path.join(root, ".orch")
 
 
 def state_dir():
     home = os.environ.get("ORCH_HOME")
     if home:
         return os.path.abspath(home)
-    return os.path.join(main_checkout(), ".agents", "orchestration")
+    return os.path.join(project_root(), ".agents", "orchestration")
 
 
 def detect_platform():
@@ -786,10 +878,9 @@ def create_worktree(platform, tid):
     """Make and provision the ticket's worktree from BASE_BRANCH. Returns
     (realpath, worktree_ref or None); refuses (exit 3) leaving nothing behind."""
     main = main_checkout()
-    base = read_base_branch(os.path.join(main, ".env"))
+    base, orch_file = base_branch()
     if not base:
-        raise cannot_create(tid, "BASE_BRANCH is not set in %s"
-                            % os.path.join(main, ".env"))
+        raise cannot_create(tid, "BASE_BRANCH is not set in %s" % orch_file)
     name = worktree_name(tid)
     if platform == "orca":
         return orca_create_worktree(main, tid, name, base)
@@ -1577,41 +1668,8 @@ def launch_steps(db, sdir, cfg, row, evs, platform, session, prompt_file,
 def cmd_init(args):
     sdir = state_dir()
     os.makedirs(sdir, exist_ok=True)
-    gi = os.path.join(sdir, ".gitignore")
-    lines = []
-    if os.path.exists(gi):
-        with open(gi) as f:
-            lines = f.read().splitlines()
-    missing = [x for x in ("state.db*", "logs/", "briefs/") if x not in [l.strip() for l in lines]]
-    if missing or not os.path.exists(gi):
-        with open(gi, "w") as f:
-            f.write("\n".join(lines + missing) + "\n")
     connect(sdir).close()
     emit(args, {"state_dir": sdir}, "initialized %s" % sdir)
-
-
-def read_base_branch(path):
-    if not os.path.exists(path):
-        return None
-    value = None
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if line.startswith("export "):
-                line = line[len("export "):].lstrip()
-            key, sep, val = line.partition("=")
-            if not sep or key.strip() != "BASE_BRANCH":
-                continue
-            val = val.strip()
-            if val[:1] in ("'", '"'):
-                end = val.find(val[0], 1)
-                val = val[1:end] if end != -1 else val[1:]
-            else:
-                val = re.split(r"\s#", val, maxsplit=1)[0].strip()
-            value = val
-    return value or None
 
 
 def cmd_preflight(args):
@@ -1620,9 +1678,9 @@ def cmd_preflight(args):
     cfg = load_config(sdir)
     platform = resolve_platform()
     failures = []
-    base = read_base_branch(os.path.join(main, ".env"))
+    base, orch_file = base_branch()
     if not base:
-        failures.append("BASE_BRANCH is not set in %s" % os.path.join(main, ".env"))
+        failures.append("BASE_BRANCH is not set in %s" % orch_file)
     verify_env = None
     has_ddev_cfg = os.path.exists(os.path.join(main, ".ddev", "config.yaml"))
     if has_ddev_cfg and shutil.which("ddev"):
@@ -2398,9 +2456,10 @@ class Selftest:
                 and not shutil.which(harness_bin(harness)):
             fails.append("`%s` is not on PATH" % harness_bin(harness))
         try:
-            main = main_checkout()
-            if not read_base_branch(os.path.join(main, ".env")):
-                fails.append("BASE_BRANCH is not set in %s" % os.path.join(main, ".env"))
+            main_checkout()
+            base, orch_file = base_branch()
+            if not base:
+                fails.append("BASE_BRANCH is not set in %s" % orch_file)
         except Refusal as e:
             fails.append(str(e))
         if fails:
@@ -2966,31 +3025,17 @@ def hook_claude_pid():
 
 
 def hook_locate(cwd):
-    """(state dir, cwd is in the main checkout) for the hook's cwd; the state
-    dir is None when there is none."""
-    git = ["git", "-C", cwd, "rev-parse"]
-    p = subprocess.run(git + ["--path-format=absolute", "--git-common-dir",
-                              "--show-toplevel"],
-                       capture_output=True, text=True, timeout=5)
-    if p.returncode != 0:
-        p = subprocess.run(git + ["--git-common-dir", "--show-toplevel"],
-                           capture_output=True, text=True, timeout=5)
-    lines = p.stdout.splitlines() if p.returncode == 0 else []
-    in_main = False
-    main = None
-    if len(lines) >= 2:
-        common = lines[0].strip()
-        if not os.path.isabs(common):
-            common = os.path.join(cwd, common)
-        main = os.path.dirname(os.path.realpath(common))
-        in_main = os.path.realpath(lines[1].strip()) == main
+    """The state dir for the hook's cwd, or None when there is none. Which
+    ticket (if any) the session belongs to is decided by matching the cwd
+    against ticket worktrees, so the main orchestrator in the project root
+    or main checkout matches none."""
     home = os.environ.get("ORCH_HOME")
     if home:
-        return os.path.abspath(home), in_main
-    if main is None:
-        return None, False
-    return os.path.join(main, ".agents", "orchestration"), in_main
-
+        return os.path.abspath(home)
+    try:
+        return os.path.join(project_root(cwd), ".agents", "orchestration")
+    except (Refusal, OSError, subprocess.SubprocessError):
+        return None
 
 def hook_skip(event, sid, row, pid):
     """True if this hook must leave `row` alone."""
@@ -3038,8 +3083,8 @@ def run_hook():
     cwd = os.path.realpath(cwd)
     if not os.path.isdir(cwd):
         return
-    sdir, in_main = hook_locate(cwd)
-    if in_main or not sdir or not os.path.isfile(os.path.join(sdir, "state.db")):
+    sdir = hook_locate(cwd)
+    if not sdir or not os.path.isfile(os.path.join(sdir, "state.db")):
         return
     out = None
     db = connect(sdir, timeout=2)
@@ -3047,7 +3092,9 @@ def run_hook():
         # Match under a plain read; most hooks end here without a write lock.
         rows = db.execute("SELECT * FROM tickets WHERE retired_at IS NULL"
                           " AND worktree IS NOT NULL").fetchall()
-        matches = [r for r in rows if contains(r["worktree"], cwd)]
+        # A main checkout (its .git is a directory) is never a ticket's.
+        matches = [r for r in rows if contains(r["worktree"], cwd)
+                   and not os.path.isdir(os.path.join(r["worktree"], ".git"))]
         if not matches:
             return
         row = max(matches, key=lambda r: (len(r["worktree"]),

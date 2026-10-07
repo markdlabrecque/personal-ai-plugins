@@ -44,7 +44,7 @@ class PlatformTestCase(OrchTestCase):
         super().setUp()
         for k in list(self.env):
             if k.startswith(SCRUB_PREFIXES) or k in SCRUB_KEYS:
-                if k != "ORCH_CLAUDE_BIN":
+                if k not in ("ORCH_CLAUDE_BIN", "ORCH_PROJECTS_DIR"):
                     del self.env[k]
         self.set_test_platform_env()
         self._platform_records = {}
@@ -243,8 +243,7 @@ class PlatformPreflightTests(PlatformTestCase):
             for tool in ("ddev", "orca", "herdr"):
                 if os.path.exists(os.path.join(d, tool)):
                     self.skipTest("%s/%s exists; cannot control PATH" % (d, tool))
-        with open(os.path.join(self.repo, ".env"), "w") as f:
-            f.write("BASE_BRANCH=main\n")
+        self.write_orch("BASE_BRANCH=main\n")
         os.makedirs(os.path.join(self.repo, ".ddev"))
         with open(os.path.join(self.repo, ".ddev", "config.yaml"), "w") as f:
             f.write("name: test\n")
@@ -276,7 +275,7 @@ class PlatformPreflightTests(PlatformTestCase):
                          "herdr")
 
     def test_platform_failure_listed_with_others(self):
-        os.remove(os.path.join(self.repo, ".env"))
+        self.write_orch("")
         p = self.refused(5, "preflight", env={"ORCH_PLATFORM": "herdr"})
         out = p.stdout + p.stderr
         self.assertIn("BASE_BRANCH", out)
