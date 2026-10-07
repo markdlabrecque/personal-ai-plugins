@@ -24,6 +24,11 @@
       "name": "lsp-servers",
       "source": "./lsp-servers",
       "description": "Language servers for PHP (Intelephense), Python (pyright), Rust (rust-analyzer), and bash (bash-language-server), exposing the built-in LSP tool to agents."
+    },
+    {
+      "name": "orchestration",
+      "source": "./orchestration",
+      "description": "Run coding tickets end to end: one worktree and orchestrator session per ticket on Claude Code, Pi or Codex, a TDD stage-agent pipeline, squash-merge on green CI, and SQLite state that survives crashes."
     }
   ]
 }

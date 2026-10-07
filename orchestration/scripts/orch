@@ -1,0 +1,3223 @@
+#!/usr/bin/env python3
+"""orch: orchestration state CLI. Contract: skills/orchestration/references/orch-cli.md"""
+
+import argparse
+import collections
+import contextlib
+import glob
+import datetime
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+EXIT_USAGE, EXIT_GATE, EXIT_NOT_FOUND, EXIT_PREFLIGHT = 2, 3, 4, 5
+
+PHASE_STATUS = {
+    "ready": "ready",
+    "dispatched": "in_progress",
+    "spec": "in_progress",
+    "tests": "in_progress",
+    "implement": "in_progress",
+    "fix": "in_progress",
+    "review": "in_review",
+    "verify": "verified",
+    "report": "verified",
+    "mr": "verified",
+    "ci": "verified",
+    "done": "done",
+    "blocked": "blocked",
+}
+
+TRANSITIONS = {
+    "dispatched": {"spec"},
+    "spec": {"tests", "implement"},
+    "tests": {"implement"},
+    "implement": {"review"},
+    "review": {"fix", "verify", "report"},
+    "fix": {"review", "ci"},
+    "verify": {"fix", "report"},
+    "report": {"mr"},
+    "mr": {"ci"},
+    "ci": {"fix", "mr"},
+}
+
+REVIEW_CAP = 2
+# Ticket sessions run unattended: each harness skips its permission prompts by
+# default. Pi has none; `--approve` trusts the worktree's project resources
+# (print mode skips them otherwise, interactive mode would ask). Codex runs
+# its plugin hooks without per-hook trust approval.
+DEFAULT_CONFIG = {"max_workers": 3, "claude_args": ["--dangerously-skip-permissions"],
+                  "pi_args": ["--approve"],
+                  "codex_args": ["--dangerously-bypass-approvals-and-sandbox",
+                                 "--dangerously-bypass-hook-trust", "--enable", "hooks"],
+                  "stall_minutes": 20}
+PLATFORMS = ("headless", "orca", "herdr", "desktop")
+# The agent CLI that runs the sessions. Ticket sessions run on the harness the
+# main orchestrator runs on, whatever the platform.
+HARNESSES = ("claude", "pi", "codex")
+HARNESS_BIN = {"claude": ("ORCH_CLAUDE_BIN", "claude"), "pi": ("ORCH_PI_BIN", "pi"),
+               "codex": ("ORCH_CODEX_BIN", "codex")}
+HARNESS_ARGS = {"claude": "claude_args", "pi": "pi_args", "codex": "codex_args"}
+# What each harness exports to the commands its agent runs.
+HARNESS_MARKERS = (("pi", "PI_CODING_AGENT", "true"), ("codex", "CODEX_THREAD_ID", None),
+                   ("claude", "CLAUDECODE", "1"))
+# Variables a Pi session or subagent passes to its children; a ticket session
+# orch starts is neither.
+LAUNCH_ENV_DROP = ("PI_SUBAGENT_CHILD", "PI_SUBAGENT_ID", "PI_SUBAGENT_COORD_DIR",
+                   "PI_SUBAGENT_MAX_TOKENS", "ORCH_PI_PARENT_SESSION")
+HOOK_EVENTS = ("SessionStart", "PostToolUse", "Stop", "SessionEnd")
+POST_TOOL_THROTTLE_S = 15
+# orca/herdr pass the prompt as one command-line argument; Linux caps a single
+# argument at 128 KB (MAX_ARG_STRLEN).
+MAX_PANE_PROMPT = 128 * 1024
+TICKET_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+# Columns added after the first release; older databases gain them on first use.
+NEW_COLUMNS = (
+    ("brief", "TEXT"),
+    ("platform", "TEXT"),
+    ("launch_ref", "TEXT"),
+    ("activity", "TEXT"),
+    ("last_seen_at", "TEXT"),
+    ("pid_start", "TEXT"),
+    ("session_seen", "INTEGER NOT NULL DEFAULT 0"),
+    ("launched_at", "TEXT"),
+    ("worktree_ref", "TEXT"),
+    ("launching", "TEXT"),
+    # Folder trust orch added to Claude's user config: 0 none, 1 the key in an
+    # existing project entry, 2 the whole entry.
+    ("trust_marked", "INTEGER NOT NULL DEFAULT 0"),
+    ("harness", "TEXT"),
+    # 1 when orch added the worktree's trust table to Codex's config.toml.
+    ("trust_codex", "INTEGER NOT NULL DEFAULT 0"),
+)
+PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+BUNDLED_ENGINES = {
+    "create": os.path.join(PLUGIN_ROOT, "skills", "create-worktree", "scripts",
+                           "setup-worktree.sh"),
+    "retire": os.path.join(PLUGIN_ROOT, "skills", "retire-worktree", "scripts",
+                           "retire-worktree.sh"),
+}
+TRUST_MSG = ("%s is waiting at the folder-trust prompt in %s; open that terminal"
+             " and accept it once (orch could not mark the folder trusted)")
+# Orca: how long `terminal wait --for tui-idle` may take to report a trust block.
+ORCA_TRUST_WAIT_MS = 20000
+# Writes of Claude's user config tried before giving up on a concurrent writer.
+TRUST_WRITES = 3
+TRUST_KEY = "hasTrustDialogAccepted"
+# An in-flight launch/retire marker older than this is abandoned.
+LAUNCH_MARKER_S = 600
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS tickets (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
+    title TEXT,
+    url TEXT,
+    phase TEXT NOT NULL,
+    prior_phase TEXT,
+    review_rounds INTEGER NOT NULL DEFAULT 0,
+    pid INTEGER,
+    session_id TEXT,
+    worktree TEXT,
+    attempt INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    retired_at TEXT
+);
+CREATE TABLE IF NOT EXISTS events (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticket TEXT NOT NULL,
+    ts TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    from_phase TEXT,
+    to_phase TEXT,
+    detail TEXT
+);
+CREATE TABLE IF NOT EXISTS ci_results (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticket TEXT NOT NULL,
+    sha TEXT NOT NULL,
+    verdict TEXT NOT NULL,
+    ts TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS selftest_runs (
+    run TEXT PRIMARY KEY,
+    state TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"""
+
+
+class Refusal(Exception):
+    def __init__(self, code, msg):
+        super().__init__(msg)
+        self.code = code
+
+
+def now():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+
+
+# ---- locations ------------------------------------------------------------
+
+def main_checkout():
+    p = subprocess.run(
+        ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        capture_output=True, text=True,
+    )
+    if p.returncode != 0:
+        p = subprocess.run(["git", "rev-parse", "--git-common-dir"],
+                           capture_output=True, text=True)
+    if p.returncode != 0:
+        raise Refusal(1, "not inside a git repository: " + p.stderr.strip())
+    common = p.stdout.strip()
+    if not os.path.isabs(common):
+        common = os.path.join(os.getcwd(), common)
+    return os.path.dirname(os.path.realpath(common))
+
+
+def state_dir():
+    home = os.environ.get("ORCH_HOME")
+    if home:
+        return os.path.abspath(home)
+    return os.path.join(main_checkout(), ".agents", "orchestration")
+
+
+def detect_platform():
+    """The platform the environment shows. With no host signal (a plain
+    terminal), headless."""
+    if os.environ.get("HERDR_ENV") == "1":
+        return "herdr"
+    if os.environ.get("ORCA_TERMINAL_HANDLE") or os.environ.get("ORCA_WORKTREE_ID"):
+        return "orca"
+    if os.environ.get("CLAUDE_CODE_ENTRYPOINT") == "claude-desktop":
+        return "desktop"
+    return "headless"
+
+
+def resolve_platform():
+    """ORCH_PLATFORM, else the platform the environment shows."""
+    forced = os.environ.get("ORCH_PLATFORM")
+    if forced:
+        if forced not in PLATFORMS:
+            raise Refusal(EXIT_USAGE, "ORCH_PLATFORM must be one of %s, not %r"
+                          % (", ".join(PLATFORMS), forced))
+        return forced
+    return detect_platform()
+
+
+def harness_markers():
+    """The harnesses whose markers are in the environment."""
+    return [h for h, key, value in HARNESS_MARKERS
+            if os.environ.get(key) and (value is None or os.environ.get(key) == value)]
+
+
+def detect_harness():
+    """The harness this orch runs under, from what the harnesses export to
+    their tools. With several (one agent started from another), the nearest
+    agent process up the process tree decides; with none, claude."""
+    found = harness_markers()
+    if len(found) == 1:
+        return found[0]
+    if found:
+        pid, harness = walk_to_agent(os.getppid(), 12)
+        return harness if harness in found else found[0]
+    return "claude"
+
+
+def resolve_harness(given=None):
+    """(harness, source): `given` (a --harness flag), else ORCH_HARNESS, else
+    the detected one, else claude."""
+    if given:
+        return given, "flag"
+    forced = os.environ.get("ORCH_HARNESS")
+    if forced:
+        if forced not in HARNESSES:
+            raise Refusal(EXIT_USAGE, "ORCH_HARNESS must be one of %s, not %r"
+                          % (", ".join(HARNESSES), forced))
+        return forced, "env"
+    if harness_markers():
+        return detect_harness(), "detected"
+    return "claude", "default"
+
+
+def check_harness_platform(harness, platform):
+    if platform == "desktop" and harness != "claude":
+        raise Refusal(EXIT_GATE, "desktop hosts Claude sessions only; %s ticket sessions"
+                      " need headless, orca or herdr" % harness)
+
+
+def harness_bin(harness):
+    var, default = HARNESS_BIN[harness]
+    return os.environ.get(var, default)
+
+
+def require_platform(given=None):
+    """The platform a launch/resume/retire uses: `given`, else the resolved one."""
+    return given or resolve_platform()
+
+
+def platform_bin(platform):
+    if platform == "orca":
+        return os.environ.get("ORCH_ORCA_BIN", "orca")
+    if platform == "herdr":
+        return os.environ.get("ORCH_HERDR_BIN", "herdr")
+    return None
+
+
+def load_config(sdir):
+    cfg = dict(DEFAULT_CONFIG)
+    path = os.path.join(sdir, "config.json")
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except (OSError, ValueError) as e:
+            raise Refusal(EXIT_GATE, "invalid config.json at %s: %s" % (path, e))
+        if not isinstance(data, dict):
+            raise Refusal(EXIT_GATE, "invalid config.json at %s: expected a JSON object"
+                          % path)
+        cfg.update(data)
+    return cfg
+
+
+def connect(sdir, timeout=30):
+    os.makedirs(sdir, exist_ok=True)
+    db = sqlite3.connect(os.path.join(sdir, "state.db"), timeout=timeout,
+                         isolation_level=None)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA busy_timeout=%d" % int(timeout * 1000))
+    if db.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal":
+        db.execute("PRAGMA journal_mode=WAL")
+    have = {r[0] for r in db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    if not {"tickets", "events", "ci_results", "selftest_runs"} <= have:
+        db.executescript(SCHEMA)
+    cols = {r[1] for r in db.execute("PRAGMA table_info(tickets)")}
+    for name, decl in NEW_COLUMNS:
+        if name not in cols:
+            db.execute("ALTER TABLE tickets ADD COLUMN %s %s" % (name, decl))
+    return db
+
+
+@contextlib.contextmanager
+def transaction(db, write=True):
+    db.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+    try:
+        yield
+    except BaseException:
+        db.execute("ROLLBACK")
+        raise
+    db.execute("COMMIT")
+
+
+# ---- helpers ---------------------------------------------------------------
+
+def ps_env():
+    """`lstart` is printed in the local time zone and language: pin both, so a
+    start time recorded by one process compares equal in any other."""
+    return dict(os.environ, LC_ALL="C", TZ="UTC")
+
+
+def ps_field(pid, field):
+    """One `ps` column for `pid`, whitespace-normalised; None if no such process."""
+    try:
+        p = subprocess.run(["ps", "-ww", "-o", field + "=", "-p", str(int(pid))],
+                           capture_output=True, text=True, timeout=5, env=ps_env())
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+    out = " ".join(p.stdout.split())
+    return out if p.returncode == 0 and out else None
+
+
+def session_alive(pid, sid, pid_start=None, activity=None):
+    """True only if `pid` exists and is provably the recorded session: same
+    start time when one was recorded, else `sid` is an argument on its command
+    line. A reused pid never counts as alive; nor does an ended session."""
+    if not pid or activity == "ended":
+        return False
+    if pid_start:
+        return ps_field(pid, "lstart") == pid_start
+    if not sid:
+        return False
+    cmd = ps_field(pid, "command")
+    return cmd is not None and sid in cmd.split()
+
+
+def row_alive(row):
+    return session_alive(row["pid"], row["session_id"], row["pid_start"],
+                         row["activity"])
+
+
+def parse_ts(ts):
+    try:
+        return datetime.datetime.fromisoformat(ts) if ts else None
+    except ValueError:
+        return None
+
+
+def age_s(ts):
+    t = parse_ts(ts)
+    if t is None:
+        return None
+    return (datetime.datetime.now(datetime.timezone.utc) - t).total_seconds()
+
+
+def stall_s(cfg):
+    return float(cfg.get("stall_minutes", 20)) * 60
+
+
+def row_platform(row):
+    return row["platform"] or "headless"
+
+
+def row_harness(row):
+    return row["harness"] or "claude"
+
+
+def row_launch_ref(row):
+    try:
+        ref = json.loads(row["launch_ref"]) if row["launch_ref"] else None
+    except ValueError:
+        return None
+    return ref if isinstance(ref, dict) else None
+
+
+def health(row, alive, cfg):
+    if alive:
+        if row["activity"] == "idle":
+            return "idle"
+        if row["activity"] == "working":
+            age = age_s(row["last_seen_at"])
+            if age is not None and age > stall_s(cfg):
+                return "stalled"
+        return "working"
+    return "none" if row["pid"] is None else "dead"
+
+
+def is_stale(row, alive, cfg):
+    if not is_active(row) or alive:
+        return False
+    if row_platform(row) != "headless" and row["pid"] is None:
+        # Its pid only arrives with the first hook: give it stall_minutes.
+        age = age_s(row["launched_at"])
+        if age is not None and age < stall_s(cfg):
+            return False
+    return True
+
+
+def get_ticket(db, tid):
+    row = db.execute("SELECT * FROM tickets WHERE id=?", (tid,)).fetchone()
+    if row is None:
+        raise Refusal(EXIT_NOT_FOUND, "ticket not found: %s" % tid)
+    return row
+
+
+def ticket_dict(row, cfg, full=True, alive=None):
+    if alive is None:
+        alive = row_alive(row)
+    d = {
+        "id": row["id"],
+        "phase": row["phase"],
+        "status": PHASE_STATUS[row["phase"]],
+        "platform": row_platform(row),
+        "harness": row_harness(row),
+        "health": health(row, alive, cfg),
+        "activity": row["activity"],
+        "last_seen_at": row["last_seen_at"],
+        "review_rounds": row["review_rounds"],
+        "pid": row["pid"],
+        "alive": alive,
+        "retired": row["retired_at"] is not None,
+        "retired_at": row["retired_at"],
+    }
+    if full:
+        d.update({
+            "title": row["title"],
+            "url": row["url"],
+            "attempt": row["attempt"],
+            "session_id": row["session_id"],
+            "worktree": row["worktree"],
+            "prior_phase": row["prior_phase"],
+            "launch_ref": row_launch_ref(row),
+            "launched_at": row["launched_at"],
+            "created_at": row["created_at"],
+        })
+    return d
+
+
+def log_event(db, tid, kind, from_phase, to_phase, detail=None):
+    return db.execute(
+        "INSERT INTO events (ticket, ts, kind, from_phase, to_phase, detail)"
+        " VALUES (?,?,?,?,?,?)",
+        (tid, now(), kind, from_phase, to_phase, detail),
+    ).lastrowid
+
+
+def is_active(row):
+    return row["phase"] not in ("ready", "done", "blocked") and row["retired_at"] is None
+
+
+# ---- in-flight marker ----------------------------------------------------------
+# spawn, resume and retire run platform commands and engines without holding
+# the write lock. The `launching` column claims the ticket meanwhile, so a
+# second one cannot start on it.
+
+def launch_marker(row):
+    try:
+        m = json.loads(row["launching"]) if row["launching"] else None
+    except ValueError:
+        return None
+    return m if isinstance(m, dict) else None
+
+
+def launch_in_progress(row):
+    """The ticket's marker while it is live: younger than LAUNCH_MARKER_S and
+    its orch process still running. Else None (no marker, or abandoned)."""
+    m = launch_marker(row)
+    if not m:
+        return None
+    age = age_s(m.get("at"))
+    if age is None or age > LAUNCH_MARKER_S:
+        return None
+    pid = m.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or not target_exists(pid, False):
+        return None
+    if m.get("pid_start") and ps_field(pid, "lstart") != m["pid_start"]:
+        return None
+    return m
+
+
+def refuse_if_launching(row, tid=None):
+    m = launch_in_progress(row)
+    if m:
+        raise Refusal(EXIT_GATE, "launch in progress for %s: orch pid %s started a %s at"
+                      " %s; wait for it to finish (a marker older than %d minutes, or"
+                      " whose orch process is gone, is ignored)" % (
+                          tid or row["id"], m.get("pid"), m.get("op", "launch"),
+                          m.get("at"), LAUNCH_MARKER_S // 60))
+
+
+def claim_launch(db, row, op):
+    """Inside a write transaction: refuse if another launch holds the ticket,
+    else claim it. Returns the marker, which only its owner clears."""
+    refuse_if_launching(row)
+    pid = os.getpid()
+    marker = json.dumps({"token": uuid.uuid4().hex, "op": op, "pid": pid,
+                         "pid_start": ps_field(pid, "lstart"), "at": now()})
+    db.execute("UPDATE tickets SET launching=? WHERE id=?", (marker, row["id"]))
+    return marker
+
+
+def release_launch(db, tid, marker):
+    """Best effort, in its own transaction: clear our marker."""
+    try:
+        with transaction(db):
+            db.execute("UPDATE tickets SET launching=NULL WHERE id=? AND launching=?",
+                       (tid, marker))
+    except sqlite3.Error as e:
+        print("orch: warning: could not clear the launch marker of %s: %s" % (tid, e),
+              file=sys.stderr)
+
+
+def emit(args, obj, text):
+    if args.json:
+        print(json.dumps(obj))
+    elif text:
+        print(text)
+
+
+def fmt_ticket(t):
+    return "%s\t%s\t%s\t%s\t%s\trounds=%s\tpid=%s\talive=%s%s" % (
+        t["id"], t["phase"], t["status"], t["platform"], t["health"],
+        t["review_rounds"], t["pid"], "yes" if t["alive"] else "no",
+        "\tretired" if t["retired"] else "")
+
+
+def emit_tickets(args, rows, cfg):
+    ts = [ticket_dict(r, cfg, full=False) for r in rows]
+    emit(args, {"tickets": ts}, "\n".join(fmt_ticket(t) for t in ts))
+
+
+def log_path(sdir, tid):
+    return os.path.join(sdir, "logs", tid + ".log")
+
+
+# The orchestration skill is user-invoked only (disable-model-invocation; on
+# Codex, agents/openai.yaml), so a fresh ticket session loads it by starting
+# its prompt with the harness's own invocation of it.
+SKILL_COMMANDS = {"claude": "/orchestration:orchestration", "pi": "/skill:orchestration",
+                  "codex": "$orchestration:orchestration"}
+SKILL_COMMAND = SKILL_COMMANDS["claude"]
+
+
+def ticket_prompt(brief, harness="claude"):
+    return "%s %s" % (SKILL_COMMANDS[harness], brief)
+
+
+def resume_prompt(tid, harness):
+    """The prompt that continues a ticket session. Claude's resumed session
+    still holds the skill. Pi and Codex get the skill command again: a session
+    killed before its first turn was saved resumes empty, and the skill is
+    user-invoked only, so nothing else would load it."""
+    text = ("You are resuming work on ticket %s. Your previous session stopped. Run"
+            " `orch show %s` first to read the current state, then continue from the"
+            " recorded phase." % (tid, tid))
+    return text if harness == "claude" else ticket_prompt(text, harness)
+
+
+def write_prompt(sdir, name, text):
+    """The prompt file a session reads its prompt from (headless: stdin)."""
+    briefs = os.path.join(sdir, "briefs")
+    path = os.path.join(briefs, name)
+    try:
+        os.makedirs(briefs, exist_ok=True)
+        with open(path, "w") as f:
+            f.write(text)
+    except OSError as e:
+        raise Refusal(EXIT_GATE, "cannot write prompt file %s: %s" % (path, e))
+    return path
+
+
+def session_created(sdir, tid, sid, harness="claude"):
+    """True if the ticket's headless log shows the session `sid` was created:
+    claude's stream-json lines carry `session_id`, pi's JSON mode starts with
+    a session header carrying `id`."""
+    try:
+        with open(log_path(sdir, tid)) as f:
+            for line in f:
+                if sid not in line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                if harness == "claude" and obj.get("session_id") == sid:
+                    return True
+                if harness == "pi" and obj.get("type") == "session" \
+                        and obj.get("id") == sid:
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+def cannot_start(what, cwd, err):
+    return Refusal(EXIT_GATE, "cannot start %s in %s: %s" % (what, cwd, err))
+
+
+def launch_headless(sdir, tid, cwd, argv, prompt_file, harness="claude"):
+    os.makedirs(os.path.join(sdir, "logs"), exist_ok=True)
+    binary = harness_bin(harness)
+    env = {k: v for k, v in os.environ.items() if k not in LAUNCH_ENV_DROP}
+    try:
+        with open(log_path(sdir, tid), "ab") as log, open(prompt_file, "rb") as stdin:
+            proc = subprocess.Popen(
+                [binary] + argv, cwd=cwd, stdin=stdin, stdout=log, stderr=log,
+                start_new_session=True, env=env,
+            )
+    except OSError as e:
+        raise cannot_start(binary, cwd, e)
+    return proc.pid
+
+
+class ToolError(Exception):
+    def __init__(self, msg, code=None, message=None, reply=None):
+        super().__init__(msg)
+        self.code = code
+        self.message = message or ""
+        self.reply = reply
+
+
+def call_tool(platform, args, timeout=60):
+    """Run one orca/herdr command; return its parsed JSON reply (None if it
+    printed no JSON). Raises ToolError on a non-zero exit or an error reply:
+    herdr exits 0 with a top-level "error"; orca exits 1 with `"ok": false`."""
+    binary = platform_bin(platform)
+    what = "`%s %s`" % (platform, " ".join(args[:2]))
+    try:
+        p = subprocess.run([binary] + args, capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise ToolError("%s: %s" % (binary, e))
+    reply = None
+    for stream in (p.stdout, p.stderr):
+        try:
+            reply = json.loads(stream)
+            break
+        except ValueError:
+            pass
+    if p.returncode == 0 and stream is p.stderr:
+        reply = None  # a clean exit replies on stdout only
+    err = reply.get("error") if isinstance(reply, dict) else None
+    if p.returncode != 0 or err or (isinstance(reply, dict) and reply.get("ok") is False):
+        code = message = None
+        if isinstance(err, dict):
+            code, message = err.get("code"), err.get("message")
+        elif isinstance(err, str):
+            message = err
+        detail = message or p.stderr.strip() or p.stdout.strip()
+        raise ToolError("%s %s: %s%s" % (
+            what, "exited %d" % p.returncode if p.returncode else "failed",
+            "[%s] " % code if code else "", str(detail)[:300]),
+            code=code, message=message, reply=reply)
+    return reply
+
+
+def call_tool_json(platform, args, timeout=60):
+    reply = call_tool(platform, args, timeout)
+    if not isinstance(reply, dict):
+        raise ToolError("`%s %s` did not reply with a JSON object"
+                        % (platform, " ".join(args[:2])))
+    return reply
+
+
+def first_string(node, key):
+    """The first non-empty string value under a key named `key`, depth first."""
+    found = all_strings(node, key)
+    return found[0] if found else None
+
+
+def all_strings(node, key):
+    """Every non-empty string value under a key named `key`, depth first."""
+    out = []
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k == key and isinstance(v, str) and v:
+                out.append(v)
+            else:
+                out.extend(all_strings(v, key))
+    elif isinstance(node, list):
+        for v in node:
+            out.extend(all_strings(v, key))
+    return out
+
+
+def dig(node, *keys):
+    for k in keys:
+        if not isinstance(node, dict):
+            return None
+        node = node.get(k)
+    if isinstance(node, (str, int)) and not isinstance(node, bool) and node != "":
+        return str(node)
+    return None
+
+
+def realpath_or_none(path):
+    return os.path.realpath(path) if isinstance(path, str) and path else None
+
+
+# ---- worktree engines --------------------------------------------------------
+
+def engine_command(kind, main):
+    """(argv prefix, env) for the create/retire engine: the main checkout's
+    own shim when it has one (pointed at the engine), else the engine."""
+    engine = (os.environ.get("ORCH_%s_ENGINE" % kind.upper())
+              or BUNDLED_ENGINES[kind])
+    shim = os.path.join(main, "scripts", "setup-worktree.sh" if kind == "create"
+                        else "retire-worktree.sh")
+    env = dict(os.environ)
+    if os.path.isfile(shim) and os.access(shim, os.X_OK):
+        env["WORKTREE_ENGINE" if kind == "create" else "RETIRE_ENGINE"] = engine
+        return [shim], env
+    return [engine], env
+
+
+def run_engine(kind, main, args, cwd, extra_env=None):
+    """Run an engine, echoing its output on stderr. Returns (exit code, the
+    last lines of its output)."""
+    argv, env = engine_command(kind, main)
+    env.update(extra_env or {})
+    try:
+        p = subprocess.Popen(argv + args, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             text=True, errors="replace")
+    except OSError as e:
+        return 127, "%s: %s" % (argv[0], e)
+    tail = collections.deque(maxlen=12)
+    for line in p.stdout:
+        sys.stderr.write(line)
+        tail.append(line.rstrip("\n"))
+    p.wait()
+    return p.returncode, "\n".join(tail)
+
+
+def worktree_name(tid):
+    """Directory and branch name of a ticket's worktree: the ticket id, in the
+    engines' alphabet (lowercase letters, digits and hyphens)."""
+    return re.sub(r"[^a-z0-9-]+", "-", tid.lower()).strip("-") or "ticket"
+
+
+def git_lines(*args):
+    p = subprocess.run(["git"] + list(args), capture_output=True, text=True)
+    return p.stdout.splitlines() if p.returncode == 0 else []
+
+
+def git_worktrees(main):
+    return [os.path.realpath(l[len("worktree "):])
+            for l in git_lines("-C", main, "worktree", "list", "--porcelain")
+            if l.startswith("worktree ")]
+
+
+def git_branches(main):
+    return set(git_lines("-C", main, "branch", "--list", "--format=%(refname:short)"))
+
+
+def git_branch_of(path):
+    lines = git_lines("-C", path, "symbolic-ref", "--quiet", "--short", "HEAD")
+    return lines[0].strip() if lines else None
+
+
+def cannot_create(tid, err):
+    return Refusal(EXIT_GATE, "cannot create a worktree for %s: %s" % (tid, err))
+
+
+def create_worktree(platform, tid):
+    """Make and provision the ticket's worktree from BASE_BRANCH. Returns
+    (realpath, worktree_ref or None); refuses (exit 3) leaving nothing behind."""
+    main = main_checkout()
+    base = read_base_branch(os.path.join(main, ".env"))
+    if not base:
+        raise cannot_create(tid, "BASE_BRANCH is not set in %s"
+                            % os.path.join(main, ".env"))
+    name = worktree_name(tid)
+    if platform == "orca":
+        return orca_create_worktree(main, tid, name, base)
+    before, branches = set(git_worktrees(main)), git_branches(main)
+    rc, tail = run_engine("create", main, [name], main, {"BASE_BRANCH": base})
+    # Only the worktree this call asked for, and only if it is new: the
+    # launch marker keeps another spawn of the same name from racing us.
+    new = [w for w in git_worktrees(main)
+           if w not in before and os.path.basename(w) == name]
+    if rc != 0:
+        if len(new) == 1:  # a half-made worktree (provisioning failed)
+            discard_engine_worktree(main, new[0], name not in branches)
+        raise cannot_create(tid, "create-worktree exited %d: %s" % (rc, tail))
+    if len(new) != 1:
+        raise cannot_create(tid, "create-worktree succeeded but no new worktree named"
+                            " %s appeared" % name)
+    return new[0], None
+
+
+def discard_engine_worktree(main, path, branch_is_new):
+    """Best effort: undo a worktree orch just made with the create engine."""
+    if branch_is_new:
+        run_engine("retire", main, [os.path.basename(path), "--force"], main)
+    if os.path.isdir(path):
+        subprocess.run(["git", "-C", main, "worktree", "remove", "--force", path],
+                       capture_output=True)
+
+
+def orca_create_worktree(main, tid, name, base):
+    args = ["worktree", "create", "--repo", "path:" + main, "--name", name,
+            "--no-parent", "--base-branch", base, "--setup", "skip", "--json"]
+    try:
+        try:
+            reply = call_tool_json("orca", args, timeout=300)
+        except ToolError as e:
+            if e.code not in ("selector_not_found", "repo_not_found"):
+                raise
+            # The repo is not registered with Orca yet: add it, retry once.
+            call_tool_json("orca", ["repo", "add", "--path", main, "--json"])
+            reply = call_tool_json("orca", args, timeout=300)
+    except ToolError as e:
+        raise cannot_create(tid, e)
+    path = realpath_or_none(dig(reply, "result", "worktree", "path"))
+    wid = dig(reply, "result", "worktree", "id")
+    if not path or not os.path.isdir(path):
+        raise cannot_create(tid, "orca reply names no worktree path: %s"
+                            % json.dumps(reply)[:200])
+    ref = {"orca_worktree": wid} if wid else None
+    rc, tail = run_engine("create", main, ["--provision"], path, {"BASE_BRANCH": base})
+    if rc != 0:
+        try:
+            call_tool("orca", ["worktree", "rm", "--worktree", orca_selector(path, ref),
+                               "--force", "--json"], timeout=120)
+        except ToolError:
+            pass
+        raise cannot_create(tid, "create-worktree --provision exited %d: %s" % (rc, tail))
+    return path, ref
+
+
+def orca_selector(path, wref):
+    if wref and wref.get("orca_worktree"):
+        return "id:" + wref["orca_worktree"]
+    return "path:" + path
+
+
+def remove_worktree(platform, tid, worktree, wref, force):
+    """Delete the ticket's DDEV project, checkout and branch. Refuses (exit 3)
+    when the engine refuses, e.g. uncommitted work without `force`."""
+    if not worktree or not os.path.isdir(worktree):
+        return
+    main = main_checkout()
+    args = [os.path.basename(worktree)]
+    if platform == "orca":
+        args.append("--ddev-only")  # Orca removes the checkout and branch itself
+    if force:
+        args.append("--force")
+    rc, tail = run_engine("retire", main, args, main)
+    if rc != 0:
+        raise Refusal(EXIT_GATE, "cannot remove the worktree of %s (%s): retire-worktree"
+                      " exited %d: %s" % (tid, worktree, rc, tail))
+    if platform == "orca":
+        try:
+            call_tool("orca", ["worktree", "rm", "--worktree", orca_selector(worktree, wref),
+                               "--force", "--json"], timeout=120)
+        except ToolError as e:
+            raise Refusal(EXIT_GATE, "cannot remove the worktree of %s (%s): %s"
+                          % (tid, worktree, e))
+
+
+def row_worktree_ref(row):
+    try:
+        ref = json.loads(row["worktree_ref"]) if row["worktree_ref"] else None
+    except ValueError:
+        return None
+    return ref if isinstance(ref, dict) else None
+
+
+# ---- platform adapters: launch, close, visible -------------------------------
+
+def herdr_agent_name(tid):
+    """Herdr agent names match [a-z][a-z0-9_-]{0,31}."""
+    return ("t" + re.sub(r"[^a-z0-9_-]", "-", tid.lower()))[:32]
+
+
+def session_flags(harness, session):
+    """The flags that start (`mode` start) or continue (resume) the session
+    `sid`. Claude and Pi take a session id we choose; Codex picks its own, so a
+    start names none and a resume is a subcommand (see agent_argv)."""
+    mode, sid = session["mode"], session["sid"]
+    if harness == "claude":
+        return ["--resume" if mode == "resume" else "--session-id", sid]
+    if harness == "pi":
+        return ["--session-id", sid]  # opens the session, or creates it
+    return []
+
+
+def headless_argv(harness, session, args):
+    if harness == "claude":
+        return (["-p"] + session_flags(harness, session)
+                + ["--output-format", "stream-json", "--verbose"] + args)
+    if harness == "pi":
+        return ["-p", "--mode", "json"] + session_flags(harness, session) + args
+    if session["mode"] == "resume":
+        return ["exec", "resume", "--json"] + args + [session["sid"], "-"]
+    return ["exec", "--json"] + args + ["-"]
+
+
+def agent_argv(harness, session, args):
+    """Arguments of an interactive session (orca, herdr), prompt excluded."""
+    if harness == "codex":
+        if session["mode"] == "resume":
+            return ["resume"] + args + [session["sid"]]
+        return list(args)
+    return session_flags(harness, session) + args
+
+
+def interactive_cmd(harness, session, args, prompt_file):
+    cmd = " ".join(shlex.quote(a) for a in
+                   [harness_bin(harness)] + agent_argv(harness, session, args))
+    return cmd + ' "$(cat %s)"' % shlex.quote(prompt_file)
+
+
+def orca_launch(tid, worktree, harness, session, args, prompt_file):
+    reply = call_tool_json("orca", [
+        "terminal", "create", "--worktree", "path:" + worktree, "--title", "t" + tid,
+        "--command", interactive_cmd(harness, session, args, prompt_file), "--json"])
+    handle = first_string(reply, "handle")
+    if not handle:
+        # A terminal may be running without a handle to name it: close them all.
+        try:
+            call_tool("orca", ["terminal", "close", "--worktree", "path:" + worktree,
+                               "--all", "--json"])
+        except ToolError:
+            pass
+        raise ToolError("orca reply has no terminal handle: %s" % json.dumps(reply)[:200])
+    return {"terminal": handle}, orca_trust_blocked(handle, worktree, harness)
+
+
+def orca_trust_blocked(handle, worktree, harness="claude"):
+    """Orca reports claude stopped at the folder-trust dialog as blockedReason
+    "agent-trust-workspace" when waiting for the TUI to go idle."""
+    try:
+        reply = call_tool("orca", [
+            "terminal", "wait", "--terminal", handle, "--for", "tui-idle",
+            "--timeout-ms", str(ORCA_TRUST_WAIT_MS), "--json"],
+            timeout=ORCA_TRUST_WAIT_MS / 1000.0 + 15)
+    except ToolError as e:
+        reply = e.reply
+    reason = first_string(reply, "blockedReason") or ""
+    return TRUST_MSG % (harness, worktree) if "trust" in reason.lower() else None
+
+
+def herdr_launch(tid, worktree, harness, session, args, prompt_file):
+    main = main_checkout()
+    agent = herdr_agent_name(tid)
+    with open(prompt_file) as f:
+        prompt = f.read()
+    reply = call_tool_json("herdr", [
+        "worktree", "open", "--cwd", main, "--path", worktree, "--label", "t" + tid,
+        "--no-focus"])
+    ws = dig(reply, "result", "workspace", "workspace_id")
+    pane = dig(reply, "result", "root_pane", "pane_id")
+    result = reply.get("result") if isinstance(reply.get("result"), dict) else {}
+    ours = result.get("already_open") is not True
+
+    def drop(agent_started=False):
+        if ws and ours:
+            platform_close("herdr", {"workspace": ws}, worktree)
+        elif agent_started and pane:
+            # Not our workspace: stop just the agent (herdr has no `agent
+            # stop`), by closing the pane it runs in.
+            try:
+                call_tool("herdr", ["pane", "close", pane])
+            except ToolError:
+                pass
+
+    if not ws or not pane:
+        drop()
+        raise ToolError("herdr reply lacks workspace or root pane id: %s"
+                        % json.dumps(reply)[:200])
+    ref = {"workspace": ws, "pane": pane, "agent": agent}
+    trust = (TRUST_MSG % (harness, worktree) + "; once accepted, send the prompt with"
+             " `herdr agent prompt %s \"$(cat %s)\"`" % (agent, shlex.quote(prompt_file)))
+    try:
+        call_tool("herdr", ["agent", "start", agent, "--kind", harness, "--pane", pane,
+                            "--"] + agent_argv(harness, session, args), timeout=120)
+    except ToolError as e:
+        if e.code == "agent_not_ready" and herdr_at_trust(agent, e):
+            return ref, trust
+        drop(agent_started=e.code == "agent_not_ready")
+        raise
+    try:
+        call_tool("herdr", ["agent", "prompt", agent, prompt])
+    except ToolError as e:
+        if e.code in ("agent_blocked", "agent_not_ready") and herdr_at_trust(agent, e):
+            return ref, trust
+        drop(agent_started=True)
+        raise
+    return ref, None
+
+
+def herdr_at_trust(agent, err):
+    """Herdr says only that the agent is blocked, not by what: the folder-trust
+    dialog is the block when the error or the agent's screen mentions trust."""
+    if "trust" in ("%s %s" % (err.message, err)).lower():
+        return True
+    try:
+        p = subprocess.run([platform_bin("herdr"), "agent", "read", agent, "--source",
+                            "visible"], capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return p.returncode == 0 and "trust" in p.stdout.lower()
+
+
+def platform_close(platform, ref, worktree):
+    """Best effort: close the terminal/workspace a launch_ref names. Returns
+    (attempted, error message or None)."""
+    ref = ref or {}
+    if platform == "orca" and ref.get("terminal") and worktree:
+        args = ["terminal", "close", "--worktree", "path:" + worktree, "--all", "--json"]
+    elif platform == "herdr" and ref.get("workspace"):
+        args = ["workspace", "close", ref["workspace"]]
+    else:
+        return False, None
+    try:
+        call_tool(platform, args)
+    except ToolError as e:
+        return True, str(e)
+    return True, None
+
+
+def visible(platform, row):
+    """Whether the platform shows the ticket's worktree and session natively:
+    True, False, or None (unknown: the platform command failed)."""
+    wt, ref = row["worktree"], row_launch_ref(row) or {}
+    detail = []
+    if platform == "headless":
+        return {"worktree": bool(wt) and os.path.isdir(wt), "session": row_alive(row),
+                "detail": "pid %s" % row["pid"]}
+    if platform == "orca":
+        try:
+            paths = all_strings(call_tool_json("orca", ["worktree", "list", "--json"]),
+                                "path")
+            in_wt = bool(wt) and wt in {os.path.realpath(p) for p in paths}
+        except ToolError as e:
+            in_wt = None
+            detail.append(str(e))
+        try:
+            handles = all_strings(call_tool_json(
+                "orca", ["terminal", "list", "--worktree", "path:%s" % wt, "--json"]),
+                "handle")
+            session = bool(ref.get("terminal")) and ref["terminal"] in handles
+        except ToolError as e:
+            # No such worktree any more: then no terminal in it either.
+            session = False if e.code == "selector_not_found" else None
+            detail.append(str(e))
+        return {"worktree": in_wt, "session": session, "detail": "; ".join(detail)}
+    if platform == "herdr":
+        agent = ref.get("agent") or herdr_agent_name(row["id"])
+        try:
+            reply = call_tool_json("herdr", ["agent", "get", agent])
+            session = True
+            detail.append("agent %s: %s" % (agent, first_string(reply, "agent_status")))
+        except ToolError as e:
+            session = False if e.code == "agent_not_found" else None
+            detail.append(str(e))
+        try:
+            reply = call_tool_json("herdr", ["worktree", "list", "--cwd", main_checkout()])
+            entries = (reply.get("result") or {}).get("worktrees") or []
+            in_wt = any(isinstance(e, dict) and e.get("open_workspace_id")
+                        and realpath_or_none(e.get("path")) == wt for e in entries)
+        except (ToolError, AttributeError) as e:
+            in_wt = None
+            detail.append(str(e))
+        return {"worktree": in_wt, "session": session, "detail": "; ".join(detail)}
+    raise Refusal(EXIT_USAGE, "visible() on %s needs the main orchestrator" % platform)
+
+
+def herdr_main_workspace(main):
+    """Id of the open Herdr workspace whose checkout is the main checkout, or
+    None. Raises ToolError when herdr cannot tell."""
+    reply = call_tool_json("herdr", ["workspace", "list"])
+    stack = [reply]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, list):
+            stack.extend(node)
+        elif isinstance(node, dict):
+            wt = node.get("worktree")
+            if node.get("workspace_id") and isinstance(wt, dict) \
+                    and realpath_or_none(wt.get("checkout_path")) == main:
+                return node["workspace_id"]
+            stack.extend(node.values())
+    return None
+
+
+# ---- folder trust in Claude's user config ------------------------------------
+
+class TrustError(Exception):
+    """Claude's user config could not be read or written. Messages never carry
+    the file's contents."""
+
+
+def claude_json_path():
+    override = os.environ.get("ORCH_CLAUDE_JSON")
+    if override:
+        return override
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~")
+    return os.path.join(base, ".claude.json")
+
+
+def read_claude_json_sig(path):
+    """(config, signature) where the signature (inode, mtime_ns, size) is of
+    the file just read, for spotting a concurrent rewrite before replacing."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            st = os.fstat(f.fileno())
+            text = f.read()
+    except FileNotFoundError:
+        raise TrustError("%s does not exist" % path)
+    except OSError as e:
+        raise TrustError("cannot read %s: %s" % (path, e.strerror))
+    except ValueError:
+        raise TrustError("%s is not valid UTF-8" % path)
+    try:
+        data = json.loads(text)
+    except ValueError:
+        raise TrustError("%s is not valid JSON" % path)
+    if not isinstance(data, dict):
+        raise TrustError("%s is not a JSON object" % path)
+    projects = data.get("projects")
+    if projects is not None and not isinstance(projects, dict):
+        raise TrustError("%s has a \"projects\" that is not an object" % path)
+    return data, file_sig(st)
+
+
+def read_claude_json(path):
+    return read_claude_json_sig(path)[0]
+
+
+def file_sig(st):
+    return (st.st_ino, st.st_mtime_ns, st.st_size)
+
+
+class ConfigChanged(Exception):
+    """The config changed between our read and our replace."""
+
+
+def write_claude_json(path, data, expect=None):
+    """Replace the file `path` names (through a symlink, so a link stays a
+    link) atomically, keeping its mode. With `expect`, a signature from
+    read_claude_json_sig, raise ConfigChanged instead of replacing a file
+    rewritten since that read."""
+    target = os.path.realpath(path)
+    try:
+        mode = os.stat(target).st_mode & 0o7777
+        fd, tmp = tempfile.mkstemp(prefix=".claude.json.orch-",
+                                   dir=os.path.dirname(target))
+    except OSError as e:
+        raise TrustError("cannot write %s: %s" % (path, e.strerror))
+    replaced = False
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fchmod(f.fileno(), mode)
+            os.fsync(f.fileno())
+        if expect is not None and file_sig(os.stat(target)) != expect:
+            raise ConfigChanged()
+        os.replace(tmp, target)
+        replaced = True
+    except OSError as e:
+        raise TrustError("cannot write %s: %s" % (path, e.strerror))
+    finally:
+        if not replaced:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def is_trusted(path):
+    """Whether Claude's user config trusts exactly `path`. Raises TrustError."""
+    data = read_claude_json(claude_json_path())
+    entry = (data.get("projects") or {}).get(path)
+    return isinstance(entry, dict) and entry.get(TRUST_KEY) is True
+
+
+def set_trust(path, want, whole_entry=False):
+    """Mark (`want`) or unmark `path` as trusted in Claude's user config.
+    Claude processes rewrite the file concurrently: the replace is skipped
+    when the file changed since it was read, and the change is re-read after
+    each write; either retries. Marking returns 0 when it was already
+    trusted, 1 when the key was added to an existing entry, 2 when the entry
+    was created. Unmarking pops the key; with `whole_entry` it removes the
+    entry when that is still exactly the one orch created.
+    A missing or invalid file is never created or overwritten: TrustError."""
+    cfg = claude_json_path()
+    added = None
+    for attempt in range(TRUST_WRITES + 1):
+        data, sig = read_claude_json_sig(cfg)
+        projects = data.get("projects")
+        if projects is None:
+            projects = {}
+        entry = projects.get(path)
+        if want:
+            done = isinstance(entry, dict) and entry.get(TRUST_KEY) is True
+        else:
+            done = not (isinstance(entry, dict) and TRUST_KEY in entry)
+        if done:
+            return added or 0
+        if attempt == TRUST_WRITES:
+            break
+        if attempt:
+            time.sleep(0.05 * 2 ** attempt)
+        if want:
+            new = 1 if isinstance(entry, dict) else 2
+            if not isinstance(entry, dict):
+                entry = projects[path] = {}
+            entry[TRUST_KEY] = True
+            data["projects"] = projects
+        elif whole_entry and entry == {TRUST_KEY: True}:
+            del projects[path]
+        else:
+            entry.pop(TRUST_KEY)
+        try:
+            write_claude_json(cfg, data, expect=sig)
+        except ConfigChanged:
+            continue
+        if want:
+            added = new
+    raise TrustError("another process kept rewriting %s; gave up after %d writes"
+                     % (cfg, TRUST_WRITES))
+
+
+def codex_home():
+    return os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+
+
+def codex_toml_key(path):
+    return '"%s"' % path.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def codex_trust_block(path):
+    return '[projects.%s]\ntrust_level = "trusted"\n' % codex_toml_key(path)
+
+
+def codex_has_project(text, path):
+    """Whether config.toml text has a projects table for `path`, in either
+    quoting Codex accepts."""
+    keys = (re.escape(codex_toml_key(path)), re.escape("'%s'" % path))
+    return re.search(r"(?m)^\s*\[\s*projects\s*\.\s*(?:%s)\s*\]\s*$" % "|".join(keys),
+                     text) is not None
+
+
+def set_codex_trust(path, want):
+    """Add (`want`) the table that trusts `path` to Codex's config.toml, only
+    when the file has no table for `path` yet, or remove exactly the table orch
+    added. Returns whether the file changed. Like set_trust, the replace is
+    skipped and retried when Codex rewrote the file since it was read. A
+    missing file is created by marking. Raises TrustError."""
+    cfg = os.path.join(codex_home(), "config.toml")
+    for attempt in range(TRUST_WRITES + 1):
+        try:
+            with open(cfg, encoding="utf-8") as f:
+                sig = file_sig(os.fstat(f.fileno()))
+                text = f.read()
+        except FileNotFoundError:
+            sig, text = None, ""
+        except (OSError, ValueError) as e:
+            raise TrustError("cannot read %s: %s" % (cfg, getattr(e, "strerror", e)))
+        block = codex_trust_block(path)
+        if want:
+            if codex_has_project(text, path):
+                return False
+            new = text + ("\n" if text and not text.endswith("\n") else "") \
+                + ("\n" if text else "") + block
+        else:
+            i = text.find(block)
+            if i < 0 or (i and text[i - 1] != "\n"):
+                return False
+            head = text[:i]
+            if head.endswith("\n\n"):
+                head = head[:-1]
+            new = head + text[i + len(block):]
+        if attempt == TRUST_WRITES:
+            break
+        if attempt:
+            time.sleep(0.05 * 2 ** attempt)
+        try:
+            write_text_atomic(cfg, new, expect=sig)
+        except ConfigChanged:
+            continue
+        return True
+    raise TrustError("another process kept rewriting %s; gave up after %d writes"
+                     % (cfg, TRUST_WRITES))
+
+
+def write_text_atomic(path, text, expect=None):
+    """write_claude_json for a text file; a missing file (expect None) is created."""
+    target = os.path.realpath(path)
+    try:
+        mode = os.stat(target).st_mode & 0o7777 if expect is not None else 0o600
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".config.toml.orch-",
+                                   dir=os.path.dirname(target))
+    except OSError as e:
+        raise TrustError("cannot write %s: %s" % (path, e.strerror))
+    replaced = False
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fchmod(f.fileno(), mode)
+            os.fsync(f.fileno())
+        if expect is None:
+            if os.path.exists(target):
+                raise ConfigChanged()
+        elif file_sig(os.stat(target)) != expect:
+            raise ConfigChanged()
+        os.replace(tmp, target)
+        replaced = True
+    except FileNotFoundError:
+        raise ConfigChanged()
+    except OSError as e:
+        raise TrustError("cannot write %s: %s" % (path, e.strerror))
+    finally:
+        if not replaced:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def same_worktree_tickets(db, tid, wt):
+    """Non-retired tickets other than `tid` whose worktree is `wt` (a realpath)."""
+    return [r for r in db.execute(
+        "SELECT * FROM tickets WHERE id<>? AND retired_at IS NULL"
+        " AND worktree IS NOT NULL ORDER BY seq", (tid,)).fetchall()
+        if os.path.realpath(r["worktree"]) == wt]
+
+
+def mark_ticket_trust(db, row):
+    """Before an orca/herdr launch: trust the ticket worktree so interactive
+    claude (or codex) does not stop at the folder-trust dialog. Failure only
+    warns. Returns the trust_mark event's seq when orch added the trust, else
+    None."""
+    if row_harness(row) == "codex":
+        return mark_codex_trust(db, row)
+    if row_harness(row) != "claude":
+        return None
+    tid, wt = row["id"], os.path.realpath(row["worktree"])
+    if any(r["trust_marked"] for r in same_worktree_tickets(db, tid, wt)):
+        # Another ticket on this worktree holds the trust orch added.
+        return None
+    try:
+        added = set_trust(wt, True)
+    except TrustError as e:
+        print("orch: warning: could not mark %s trusted for claude: %s; claude may"
+              " stop at the folder-trust prompt" % (wt, e), file=sys.stderr)
+        return None
+    if not added:
+        return None
+    with transaction(db):
+        db.execute("UPDATE tickets SET trust_marked=MAX(trust_marked, ?) WHERE id=?",
+                   (added, tid))
+        return log_event(db, tid, "trust_mark", row["phase"], row["phase"], wt)
+
+
+def mark_codex_trust(db, row):
+    tid, wt = row["id"], os.path.realpath(row["worktree"])
+    if any(r["trust_codex"] for r in same_worktree_tickets(db, tid, wt)):
+        return None
+    try:
+        added = set_codex_trust(wt, True)
+    except TrustError as e:
+        print("orch: warning: could not mark %s trusted for codex: %s; codex may"
+              " stop at the folder-trust prompt" % (wt, e), file=sys.stderr)
+        return None
+    if not added:
+        return None
+    with transaction(db):
+        db.execute("UPDATE tickets SET trust_codex=1 WHERE id=?", (tid,))
+        return log_event(db, tid, "trust_mark", row["phase"], row["phase"],
+                         "codex " + wt)
+
+
+def unmark_codex_trust(db, tid, worktree, log=True):
+    row = get_ticket(db, tid)
+    if not row["trust_codex"] or not worktree:
+        return True
+    wt = os.path.realpath(worktree)
+    others = same_worktree_tickets(db, tid, wt)
+    if others:
+        with transaction(db):
+            db.execute("UPDATE tickets SET trust_codex=1 WHERE id=?", (others[0]["id"],))
+            db.execute("UPDATE tickets SET trust_codex=0 WHERE id=?", (tid,))
+        return True
+    try:
+        set_codex_trust(wt, False)
+    except TrustError as e:
+        print("orch: warning: could not remove the folder trust orch added for %s"
+              " from codex's config: %s" % (wt, e), file=sys.stderr)
+        return False
+    with transaction(db):
+        db.execute("UPDATE tickets SET trust_codex=0 WHERE id=?", (tid,))
+        if log:
+            log_event(db, tid, "trust_unmark", row["phase"], row["phase"],
+                      "codex " + wt)
+    return True
+
+
+def unmark_ticket_trust(db, tid, worktree, log=True):
+    """Remove the folder trust orch added for the ticket (Claude's and
+    Codex's), if any. Failure only warns. Returns whether no trust orch added
+    is left."""
+    codex_ok = unmark_codex_trust(db, tid, worktree, log)
+    return unmark_claude_trust(db, tid, worktree, log) and codex_ok
+
+
+def unmark_claude_trust(db, tid, worktree, log=True):
+    row = get_ticket(db, tid)
+    marked = row["trust_marked"]
+    if not marked or not worktree:
+        return True
+    wt = os.path.realpath(worktree)
+    others = same_worktree_tickets(db, tid, wt)
+    if others:
+        # Still in use by another ticket: hand it the marker instead.
+        with transaction(db):
+            db.execute("UPDATE tickets SET trust_marked=MAX(trust_marked, ?) WHERE id=?",
+                       (marked, others[0]["id"]))
+            db.execute("UPDATE tickets SET trust_marked=0 WHERE id=?", (tid,))
+        return True
+    try:
+        set_trust(wt, False, whole_entry=marked == 2)
+    except TrustError as e:
+        print("orch: warning: could not remove the folder trust orch added for %s: %s"
+              % (wt, e), file=sys.stderr)
+        return False
+    with transaction(db):
+        db.execute("UPDATE tickets SET trust_marked=0 WHERE id=?", (tid,))
+        if log:
+            log_event(db, tid, "trust_unmark", row["phase"], row["phase"], wt)
+    return True
+
+
+class TrustBlocked(Refusal):
+    """claude stopped at the folder-trust dialog; the launch is recorded."""
+
+    def __init__(self, msg):
+        super().__init__(EXIT_GATE, msg)
+
+
+def harness_args(harness, cfg):
+    key = HARNESS_ARGS[harness]
+    return [str(a) for a in cfg.get(key, DEFAULT_CONFIG[key])]
+
+
+def start_session(platform, sdir, row, session, cfg, prompt_file):
+    """Step 2 of a launch on headless/orca/herdr. Returns (pid, launch_ref,
+    trust message or None)."""
+    tid, worktree, harness = row["id"], row["worktree"], row_harness(row)
+    args = harness_args(harness, cfg)
+    if platform == "headless":
+        pid = launch_headless(sdir, tid, worktree, headless_argv(harness, session, args),
+                              prompt_file, harness)
+        return pid, {"pid": pid}, None
+    what = "%s session" % platform
+    if not os.path.isdir(worktree):
+        raise cannot_start(what, worktree, "worktree does not exist")
+    launch = orca_launch if platform == "orca" else herdr_launch
+    try:
+        ref, blocked = launch(tid, worktree, harness, session, args, prompt_file)
+    except (ToolError, OSError) as e:
+        raise cannot_start(what, worktree, e)
+    return None, ref, blocked
+
+
+# Columns a launch's step 1 may change; a failed step 2 restores them all.
+LAUNCH_COLUMNS = ("phase", "prior_phase", "platform", "pid", "pid_start",
+                  "session_id", "worktree", "attempt", "brief", "activity",
+                  "session_seen", "launch_ref", "launched_at", "worktree_ref", "harness")
+
+
+def finish_launch(db, sdir, cfg, row, evs, platform, session, prompt_file,
+                  desktop_action, marker):
+    """Steps 2 and 3 of `spawn`/`resume` (step 1 is already committed; `row`
+    is the ticket as it was before it). Clears `marker` whatever happens.
+    Returns (output, is_action)."""
+    try:
+        return launch_steps(db, sdir, cfg, row, evs, platform, session,
+                            prompt_file, desktop_action, marker)
+    finally:
+        release_launch(db, row["id"], marker)
+
+
+def launch_steps(db, sdir, cfg, row, evs, platform, session, prompt_file,
+                 desktop_action, marker):
+    tid = row["id"]
+    cur = get_ticket(db, tid)
+    old_platform, old_ref = row_platform(row), row_launch_ref(row)
+    closed_old = False
+    if desktop_action == "desktop_resume":
+        attempted, err = platform_close(old_platform, old_ref, row["worktree"])
+        closed_old = attempted and err is None
+    if platform == "desktop":
+        # Only a Desktop session ref survives onto Desktop.
+        ref = old_ref if old_platform == "desktop" and (old_ref or {}).get("desktop") \
+            else None
+        with transaction(db):
+            db.execute("UPDATE tickets SET launch_ref=?, launching=NULL WHERE id=?"
+                       " AND launching=?", (json.dumps(ref) if ref else None, tid, marker))
+        out = {"action": desktop_action, "cwd": cur["worktree"],
+               "prompt_file": prompt_file, "title": "t" + tid}
+        if desktop_action == "desktop_resume" and ref:
+            out["ref"] = ref["desktop"]
+        return out, True
+    mark_ev = None
+    if platform in ("orca", "herdr") \
+            and cur["worktree"] and os.path.isdir(cur["worktree"]):
+        mark_ev = mark_ticket_trust(db, cur)
+    try:
+        pid, ref, blocked = start_session(platform, sdir, cur, session, cfg,
+                                          prompt_file)
+    except Refusal:
+        # Undo the trust this launch added; its event goes with the others
+        # unless the trust could not be removed.
+        evs = list(evs)
+        if mark_ev is not None and unmark_ticket_trust(db, tid, cur["worktree"],
+                                                       log=False):
+            evs.append(mark_ev)
+        # Restore step 1, except a launch_ref naming the terminal/workspace
+        # just closed: that one is gone.
+        old = [None if c == "launch_ref" and closed_old else row[c]
+               for c in LAUNCH_COLUMNS]
+        with transaction(db):
+            db.execute("UPDATE tickets SET %s, launching=NULL WHERE id=?" % ", ".join(
+                "%s=?" % c for c in LAUNCH_COLUMNS), old + [tid])
+            db.executemany("DELETE FROM events WHERE seq=?", [(e,) for e in evs])
+        raise
+    # Pi rewrites its process title and Codex is told its session id only
+    # after it starts, so neither command line names the session: their
+    # liveness needs the start time from the outset.
+    pid_start = ps_field(pid, "lstart") if pid and row_harness(cur) != "claude" else None
+    with transaction(db):
+        # orca/herdr have no pid here; the SessionStart hook may already have
+        # recorded the session's during step 2: keep it.
+        db.execute("UPDATE tickets SET pid=COALESCE(?, pid), pid_start=CASE WHEN ? IS NOT"
+                   " NULL THEN ? WHEN ? IS NULL OR pid IS ? THEN pid_start ELSE NULL END,"
+                   " launch_ref=?, launching=NULL WHERE id=?",
+                   (pid, pid_start, pid_start, pid, pid, json.dumps(ref), tid))
+        if blocked:
+            log_event(db, tid, "trust_prompt", cur["phase"], cur["phase"], blocked)
+        t = ticket_dict(get_ticket(db, tid), cfg)
+    if blocked:
+        raise TrustBlocked(blocked)
+    return t, False
+
+
+# ---- commands --------------------------------------------------------------
+
+
+def cmd_init(args):
+    sdir = state_dir()
+    os.makedirs(sdir, exist_ok=True)
+    gi = os.path.join(sdir, ".gitignore")
+    lines = []
+    if os.path.exists(gi):
+        with open(gi) as f:
+            lines = f.read().splitlines()
+    missing = [x for x in ("state.db*", "logs/", "briefs/") if x not in [l.strip() for l in lines]]
+    if missing or not os.path.exists(gi):
+        with open(gi, "w") as f:
+            f.write("\n".join(lines + missing) + "\n")
+    connect(sdir).close()
+    emit(args, {"state_dir": sdir}, "initialized %s" % sdir)
+
+
+def read_base_branch(path):
+    if not os.path.exists(path):
+        return None
+    value = None
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].lstrip()
+            key, sep, val = line.partition("=")
+            if not sep or key.strip() != "BASE_BRANCH":
+                continue
+            val = val.strip()
+            if val[:1] in ("'", '"'):
+                end = val.find(val[0], 1)
+                val = val[1:end] if end != -1 else val[1:]
+            else:
+                val = re.split(r"\s#", val, maxsplit=1)[0].strip()
+            value = val
+    return value or None
+
+
+def cmd_preflight(args):
+    main = main_checkout()
+    sdir = state_dir()
+    cfg = load_config(sdir)
+    platform = resolve_platform()
+    failures = []
+    base = read_base_branch(os.path.join(main, ".env"))
+    if not base:
+        failures.append("BASE_BRANCH is not set in %s" % os.path.join(main, ".env"))
+    verify_env = None
+    has_ddev_cfg = os.path.exists(os.path.join(main, ".ddev", "config.yaml"))
+    if has_ddev_cfg and shutil.which("ddev"):
+        verify_env = "ddev"
+    elif cfg.get("verify_harness") and shutil.which("docker"):
+        verify_env = "docker"
+    else:
+        failures.append(
+            "no verification environment: need .ddev/config.yaml with ddev on PATH"
+            " (config.yaml %s, ddev %s), or config.json verify_harness with docker"
+            " on PATH (verify_harness %s, docker %s)" % (
+                "present" if has_ddev_cfg else "missing",
+                "found" if shutil.which("ddev") else "not found",
+                "set" if cfg.get("verify_harness") else "unset",
+                "found" if shutil.which("docker") else "not found"))
+    binary = platform_bin(platform)
+    if binary and not shutil.which(binary):
+        failures.append("platform %s needs `%s` on PATH (not found)" % (platform, binary))
+    harness, source = resolve_harness()
+    if harness != "claude" and not shutil.which(harness_bin(harness)):
+        failures.append("harness %s needs `%s` on PATH (not found)"
+                        % (harness, harness_bin(harness)))
+    if platform == "desktop" and harness != "claude":
+        failures.append("desktop hosts Claude sessions only, not %s" % harness)
+    if failures:
+        raise Refusal(EXIT_PREFLIGHT, "preflight failed:\n" +
+                      "\n".join("- " + f for f in failures))
+    out = {"verify_env": verify_env, "base_branch": base, "platform": platform}
+    text = "verify_env=%s\nbase_branch=%s\nplatform=%s" % (verify_env, base, platform)
+    out.update({"harness": harness, "harness_source": source})
+    text += "\nharness=%s (%s)" % (harness, source)
+    emit(args, out, text)
+
+
+
+
+def cmd_platform(args):
+    p = resolve_platform()
+    harness, source = resolve_harness()
+    out = {"platform": p, "harness": harness, "harness_source": source}
+    emit(args, out, p + "\nharness: %s (%s)" % (harness, source))
+
+
+def cmd_add(args, db, sdir):
+    if not TICKET_ID.match(args.ticket) or ".." in args.ticket:
+        raise Refusal(EXIT_USAGE, "invalid ticket id %r: use letters, digits, '.', '_'"
+                      " and '-', starting with a letter or digit, no '..'" % args.ticket)
+    if db.execute("SELECT 1 FROM tickets WHERE id=?", (args.ticket,)).fetchone():
+        raise Refusal(EXIT_GATE, "ticket already exists: %s" % args.ticket)
+    db.execute(
+        "INSERT INTO tickets (id, title, url, phase, created_at) VALUES (?,?,?,?,?)",
+        (args.ticket, args.title, args.url, "ready", now()),
+    )
+    log_event(db, args.ticket, "add", None, "ready", args.title)
+    emit(args, ticket_dict(get_ticket(db, args.ticket), load_config(sdir)),
+         "added %s" % args.ticket)
+
+
+def cmd_list(args, db, sdir):
+    emit_tickets(args, db.execute("SELECT * FROM tickets ORDER BY seq").fetchall(),
+                 load_config(sdir))
+
+
+def cmd_show(args, db, sdir):
+    t = ticket_dict(get_ticket(db, args.ticket), load_config(sdir))
+    emit(args, t, "\n".join("%s: %s" % (k, v) for k, v in t.items()))
+
+
+def cmd_next(args, db, sdir):
+    cfg = load_config(sdir)
+    rows = db.execute("SELECT * FROM tickets ORDER BY seq").fetchall()
+    active = sum(1 for r in rows if is_active(r))
+    slots = max(0, int(cfg.get("max_workers", 3)) - active)
+    ready = [r for r in rows if r["phase"] == "ready" and r["retired_at"] is None]
+    emit_tickets(args, ready[:slots], cfg)
+
+
+def cmd_stale(args, db, sdir):
+    cfg = load_config(sdir)
+    rows = db.execute("SELECT * FROM tickets ORDER BY seq").fetchall()
+    emit_tickets(args, [r for r in rows if is_stale(r, row_alive(r), cfg)], cfg)
+
+
+def check_prompt_size(platform, tid, text):
+    size = len(text.encode("utf-8"))
+    if platform in ("orca", "herdr") and size > MAX_PANE_PROMPT:
+        raise Refusal(EXIT_GATE, "prompt for %s is %d bytes; %s passes it as one"
+                      " command-line argument, limited to %d bytes (128 KB)"
+                      % (tid, size, platform, MAX_PANE_PROMPT))
+
+
+def contains(parent, child):
+    return child == parent or child.startswith(parent.rstrip(os.sep) + os.sep)
+
+
+def check_worktree(db, tid, worktree):
+    """A ticket worktree is never the main checkout, never inside it (unless it
+    is a linked worktree of its own), and never overlaps the worktree of
+    another active ticket."""
+    try:
+        main = main_checkout()
+    except Refusal:
+        main = None
+    if main and contains(worktree, main):
+        raise Refusal(EXIT_GATE, "worktree %s is the main checkout %s or contains it;"
+                      " a ticket needs its own worktree" % (worktree, main))
+    if main and contains(main, worktree):
+        top = git_lines("-C", worktree, "rev-parse", "--show-toplevel")
+        if not top or os.path.realpath(top[0].strip()) == main:
+            raise Refusal(EXIT_GATE, "worktree %s lies inside the main checkout %s and is"
+                          " not a linked worktree; a ticket needs its own worktree"
+                          % (worktree, main))
+    for other in db.execute(
+            "SELECT id, worktree FROM tickets WHERE worktree IS NOT NULL AND id<>?"
+            " AND retired_at IS NULL AND phase NOT IN ('ready', 'done')", (tid,)):
+        if other["worktree"] == worktree:
+            raise Refusal(EXIT_GATE, "worktree %s is already used by ticket %s"
+                          % (worktree, other["id"]))
+        if contains(worktree, other["worktree"]) or contains(other["worktree"], worktree):
+            raise Refusal(EXIT_GATE, "worktree %s overlaps %s, the worktree of ticket %s"
+                          % (worktree, other["worktree"], other["id"]))
+
+
+def new_session_id(harness):
+    """The id a new session starts under: chosen by orch for claude and pi;
+    Codex picks its own, which reaches orch with the SessionStart hook."""
+    return None if harness == "codex" else str(uuid.uuid4())
+
+
+def check_spawnable(row, tid):
+    if row["retired_at"] is not None:
+        raise Refusal(EXIT_GATE, "ticket %s is retired" % tid)
+    if row["phase"] != "ready":
+        raise Refusal(EXIT_GATE, "spawn requires phase ready; %s is %s"
+                      % (tid, row["phase"]))
+
+
+def spawn_ticket(db, sdir, cfg, tid, brief, platform, worktree=None, wref=None,
+                 harness="claude"):
+    """`spawn` without the printing. With no `worktree`, the platform adapter
+    creates one first (and removes it again if the launch fails). Returns
+    (output, is_action)."""
+    check_harness_platform(harness, platform)
+    with transaction(db):
+        row = get_ticket(db, tid)
+        check_spawnable(row, tid)
+        if not brief.strip():
+            raise Refusal(EXIT_GATE, "brief for %s is empty" % tid)
+        check_prompt_size(platform, tid, ticket_prompt(brief, harness))
+        if worktree is not None:
+            if not os.path.isdir(worktree):
+                raise Refusal(EXIT_GATE, "worktree does not exist: %s" % worktree)
+            worktree = os.path.realpath(worktree)
+            check_worktree(db, tid, worktree)
+        else:
+            check_name_free(db, tid)
+        # Claimed before the worktree is made: no second spawn (of this ticket,
+        # or of one with the same worktree name) creates or launches meanwhile.
+        marker = claim_launch(db, row, "spawn")
+    try:
+        return spawn_claimed(db, sdir, cfg, tid, brief, platform, worktree, wref, marker,
+                             harness)
+    finally:
+        release_launch(db, tid, marker)
+
+
+def check_name_free(db, tid):
+    name = worktree_name(tid)
+    for other in db.execute("SELECT * FROM tickets WHERE id<>? AND retired_at IS NULL",
+                            (tid,)).fetchall():
+        if worktree_name(other["id"]) == name and launch_in_progress(other):
+            refuse_if_launching(other, "%s (worktree name %s, as for %s)"
+                                % (other["id"], name, tid))
+
+
+def spawn_claimed(db, sdir, cfg, tid, brief, platform, worktree, wref, marker,
+                  harness="claude"):
+    created = worktree is None
+    if created:
+        worktree, wref = create_worktree(platform, tid)
+
+    def discard():
+        if created:
+            try:
+                remove_worktree(platform, tid, worktree, wref, force=True)
+            except Refusal as e:
+                print("orch: warning: %s" % e, file=sys.stderr)
+
+    try:
+        with transaction(db):
+            row = get_ticket(db, tid)
+            check_spawnable(row, tid)
+            if row["launching"] != marker:
+                raise Refusal(EXIT_GATE, "the launch claim on %s was taken over;"
+                              " not launching" % tid)
+            check_worktree(db, tid, worktree)
+            prompt_file = write_prompt(sdir, tid + ".md", ticket_prompt(brief, harness))
+            sid = new_session_id(harness)
+            # Step 1: commit the intent before launching, so a crash after
+            # launch never leaves a running session behind a `ready` ticket.
+            db.execute(
+                "UPDATE tickets SET phase='dispatched', platform=?, pid=NULL,"
+                " pid_start=NULL, session_id=?, worktree=?, attempt=1, brief=?,"
+                " activity=NULL, session_seen=0, launch_ref=NULL, launched_at=?,"
+                " worktree_ref=?, harness=? WHERE id=?",
+                (platform, sid, worktree, brief, now(),
+                 json.dumps(wref) if wref else None, harness, tid))
+            ev = log_event(db, tid, "spawn", "ready", "dispatched",
+                           "session=%s platform=%s%s" % (
+                               sid, platform,
+                               "" if harness == "claude" else " harness=" + harness))
+    except Refusal:
+        discard()
+        raise
+    try:
+        return finish_launch(db, sdir, cfg, row, [ev], platform,
+                             {"mode": "start", "sid": sid}, prompt_file, "desktop_start",
+                             marker)
+    except TrustBlocked:
+        raise
+    except Refusal:
+        discard()
+        raise
+
+
+def print_launch(args, out, is_action, done_text):
+    if is_action:
+        print(json.dumps(out))
+    else:
+        emit(args, out, "%s %s on %s pid=%s session=%s" % (
+            done_text, out["id"], out["platform"], out["pid"], out["session_id"]))
+
+
+def cmd_spawn(args, db, sdir):
+    platform = require_platform(args.platform)
+    harness = resolve_harness(args.harness)[0]
+    cfg = load_config(sdir)
+    get_ticket(db, args.ticket)
+    try:
+        with open(args.brief_file) as f:
+            brief = f.read()
+    except OSError as e:
+        raise Refusal(EXIT_USAGE, "cannot read brief file: %s" % e)
+    out, is_action = spawn_ticket(db, sdir, cfg, args.ticket, brief, platform,
+                                  args.worktree, harness=harness)
+    print_launch(args, out, is_action, "spawned")
+
+
+cmd_spawn.own_tx = True
+
+
+def codex_rollout_exists(sid):
+    """Whether Codex saved the thread `sid` (its rollout file), which is what
+    `codex resume` needs: a thread killed before its first turn has none."""
+    pattern = os.path.join(codex_home(), "sessions", "*", "*", "*",
+                           "rollout-*-%s.jsonl" % glob.escape(sid))
+    return bool(glob.glob(pattern))
+
+
+def codex_thread_from_log(sdir, tid):
+    """The last thread id a headless codex printed to the ticket's log."""
+    found = None
+    try:
+        with open(log_path(sdir, tid)) as f:
+            for line in f:
+                if "thread.started" not in line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(obj, dict) and obj.get("type") == "thread.started" \
+                        and isinstance(obj.get("thread_id"), str) and obj["thread_id"]:
+                    found = obj["thread_id"]
+    except OSError:
+        pass
+    return found
+
+
+def session_continuable(sdir, row, harness):
+    """Whether the recorded session can be continued rather than started over:
+    it reported in, or its headless log shows it was created. A Codex thread
+    also needs its rollout on disk."""
+    sid = row["session_id"]
+    if not sid:
+        return False
+    if harness == "codex":
+        return codex_rollout_exists(sid)
+    return bool(row["session_seen"]) or session_created(sdir, row["id"], sid, harness)
+
+
+def resume_ticket(db, sdir, cfg, tid, note=None, platform=None, harness=None):
+    """`resume` without the printing. Returns (output, is_action)."""
+    with transaction(db):
+        row = get_ticket(db, tid)
+        if row["retired_at"] is not None:
+            raise Refusal(EXIT_GATE, "ticket %s is retired" % tid)
+        if row["phase"] in ("ready", "done"):
+            raise Refusal(EXIT_GATE, "cannot resume %s in phase %s" % (tid, row["phase"]))
+        refuse_if_launching(row)
+        if row_alive(row):
+            raise Refusal(EXIT_GATE, "session for %s is still alive (pid %s)"
+                          % (tid, row["pid"]))
+        old_harness = row_harness(row)
+        if not row["worktree"] or (not row["session_id"] and old_harness != "codex"):
+            raise Refusal(EXIT_GATE, "ticket %s has no recorded session" % tid)
+        if row["phase"] == "blocked" and not row["prior_phase"]:
+            raise Refusal(EXIT_GATE, "%s is blocked with no remembered phase" % tid)
+        platform = platform or row_platform(row)
+        harness = harness or old_harness
+        check_harness_platform(harness, platform)
+        sid = row["session_id"]
+        seen = row["session_seen"]
+        if old_harness == "codex" and not sid and row_platform(row) == "headless":
+            # Killed before its SessionStart hook attached it: its own output
+            # still names the thread.
+            sid = codex_thread_from_log(sdir, tid)
+            row = dict(row, session_id=sid)
+        extra = ("\n\nNote from the orchestrator:\n" + note) if note else ""
+        if harness == old_harness and session_continuable(sdir, row, harness):
+            prompt = resume_prompt(tid, harness) + extra
+            session = {"mode": "resume", "sid": sid}
+        else:
+            # Nothing to continue (the session never reported in, or the ticket
+            # moves to another harness): start it fresh from the brief, under
+            # the same id when the harness lets orch choose it.
+            if not (row["brief"] or "").strip():
+                raise Refusal(EXIT_GATE, "no stored brief for %s; re-spawn" % tid)
+            prompt = ticket_prompt(row["brief"] + extra, harness)
+            if harness != old_harness or harness == "codex":
+                sid, seen = new_session_id(harness), 0
+            session = {"mode": "start", "sid": sid}
+        check_prompt_size(platform, tid, prompt)
+        prompt_file = write_prompt(sdir, tid + ".resume.md", prompt)
+        evs = []
+        phase = row["phase"]
+        if phase == "blocked":
+            phase = row["prior_phase"]
+            db.execute("UPDATE tickets SET phase=?, prior_phase=NULL WHERE id=?",
+                       (phase, tid))
+            evs.append(log_event(db, tid, "unblock", "blocked", phase, "resume"))
+        attempt = row["attempt"] + 1
+        marker = claim_launch(db, row, "resume")
+        db.execute("UPDATE tickets SET pid=NULL, pid_start=NULL, activity=NULL,"
+                   " platform=?, attempt=?, launched_at=?, harness=?, session_id=?,"
+                   " session_seen=? WHERE id=?",
+                   (platform, attempt, now(), harness, sid, seen, tid))
+        mode = session["mode"]
+        if harness == "claude" and mode == "start":
+            mode = "session-id"
+        evs.append(log_event(db, tid, "resume", phase, phase,
+                             "attempt=%d mode=%s platform=%s%s%s" % (
+                                 attempt, mode, platform,
+                                 "" if harness == old_harness else " harness=" + harness,
+                                 (" note=" + note) if note else "")))
+    return finish_launch(db, sdir, cfg, row, evs, platform, session, prompt_file,
+                         "desktop_resume", marker)
+
+
+def cmd_resume(args, db, sdir):
+    platform = require_platform(args.platform)
+    if not args.platform:
+        platform = None  # the ticket's own platform
+    out, is_action = resume_ticket(db, sdir, load_config(sdir), args.ticket, args.note,
+                                   platform, args.harness)
+    print_launch(args, out, is_action, "resumed")
+
+
+cmd_resume.own_tx = True
+
+
+def cmd_attach(args, db, sdir):
+    if not args.ref and not args.session_id:
+        raise Refusal(EXIT_USAGE, "attach needs --ref and/or --session-id")
+    row = get_ticket(db, args.ticket)
+    if row["retired_at"] is not None:
+        raise Refusal(EXIT_GATE, "ticket %s is retired" % args.ticket)
+    detail = []
+    if args.ref:
+        db.execute("UPDATE tickets SET launch_ref=? WHERE id=?",
+                   (json.dumps({"desktop": args.ref}), args.ticket))
+        detail.append("ref=" + args.ref)
+    if args.session_id:
+        if args.session_id != row["session_id"]:
+            # A different session: the old process identity no longer applies.
+            db.execute("UPDATE tickets SET session_id=?, pid=NULL, pid_start=NULL,"
+                       " activity=NULL WHERE id=?", (args.session_id, args.ticket))
+        detail.append("session=" + args.session_id)
+    log_event(db, args.ticket, "attach", row["phase"], row["phase"], " ".join(detail))
+    emit(args, ticket_dict(get_ticket(db, args.ticket), load_config(sdir)),
+         "%s attached %s" % (args.ticket, " ".join(detail)))
+
+
+def cmd_phase(args, db, sdir):
+    row = get_ticket(db, args.ticket)
+    cur, new = row["phase"], args.phase
+    if row["retired_at"] is not None:
+        raise Refusal(EXIT_GATE, "ticket %s is retired" % args.ticket)
+    if new == "done":
+        raise Refusal(EXIT_GATE, "done is reachable only through `orch merged`")
+    if new not in TRANSITIONS.get(cur, ()):
+        raise Refusal(EXIT_GATE, "illegal transition %s -> %s for %s"
+                      % (cur, new, args.ticket))
+    if new == "fix" and cur in ("review", "verify") and row["review_rounds"] >= REVIEW_CAP:
+        raise Refusal(EXIT_GATE,
+                      "review cap reached (%d rounds): file the remaining findings as"
+                      " follow-up tickets and move on to verify" % row["review_rounds"])
+    rounds = row["review_rounds"] + (1 if new == "review" else 0)
+    db.execute("UPDATE tickets SET phase=?, review_rounds=? WHERE id=?",
+               (new, rounds, args.ticket))
+    log_event(db, args.ticket, "phase", cur, new, args.note)
+    emit(args, ticket_dict(get_ticket(db, args.ticket), load_config(sdir)),
+         "%s: %s -> %s" % (args.ticket, cur, new))
+
+
+def cmd_block(args, db, sdir):
+    row = get_ticket(db, args.ticket)
+    cur = row["phase"]
+    if cur in ("blocked", "done") or row["retired_at"] is not None:
+        raise Refusal(EXIT_GATE, "cannot block %s in phase %s%s" % (
+            args.ticket, cur, " (retired)" if row["retired_at"] else ""))
+    db.execute("UPDATE tickets SET phase='blocked', prior_phase=? WHERE id=?",
+               (cur, args.ticket))
+    log_event(db, args.ticket, "block", cur, "blocked", args.reason)
+    emit(args, ticket_dict(get_ticket(db, args.ticket), load_config(sdir)),
+         "%s blocked (was %s)" % (args.ticket, cur))
+
+
+def cmd_unblock(args, db, sdir):
+    row = get_ticket(db, args.ticket)
+    if row["phase"] != "blocked":
+        raise Refusal(EXIT_GATE, "%s is not blocked (phase %s)"
+                      % (args.ticket, row["phase"]))
+    prior = row["prior_phase"]
+    if not prior:
+        raise Refusal(EXIT_GATE, "%s has no remembered phase to return to"
+                      % args.ticket)
+    db.execute("UPDATE tickets SET phase=?, prior_phase=NULL WHERE id=?",
+               (prior, args.ticket))
+    log_event(db, args.ticket, "unblock", "blocked", prior, None)
+    emit(args, ticket_dict(get_ticket(db, args.ticket), load_config(sdir)),
+         "%s unblocked -> %s" % (args.ticket, prior))
+
+
+def cmd_ci(args, db, sdir):
+    row = get_ticket(db, args.ticket)
+    if row["phase"] != "ci":
+        raise Refusal(EXIT_GATE, "ci requires phase ci; %s is %s"
+                      % (args.ticket, row["phase"]))
+    verdict = "passed" if args.passed else "failed"
+    db.execute("INSERT INTO ci_results (ticket, sha, verdict, ts) VALUES (?,?,?,?)",
+               (args.ticket, args.sha, verdict, now()))
+    log_event(db, args.ticket, "ci", "ci", "ci", "%s %s" % (args.sha, verdict))
+    emit(args, {"id": args.ticket, "sha": args.sha, "verdict": verdict},
+         "%s: CI %s for %s" % (args.ticket, verdict, args.sha))
+
+
+def cmd_merged(args, db, sdir):
+    row = get_ticket(db, args.ticket)
+    if row["phase"] != "ci":
+        raise Refusal(EXIT_GATE, "merged requires phase ci; %s is %s"
+                      % (args.ticket, row["phase"]))
+    latest = db.execute(
+        "SELECT verdict FROM ci_results WHERE ticket=? AND sha=?"
+        " ORDER BY seq DESC LIMIT 1", (args.ticket, args.sha)).fetchone()
+    if latest is None or latest["verdict"] != "passed":
+        raise Refusal(EXIT_GATE, "no passing CI recorded for %s at %s"
+                      % (args.ticket, args.sha))
+    db.execute("UPDATE tickets SET phase='done' WHERE id=?", (args.ticket,))
+    log_event(db, args.ticket, "merged", "ci", "done", args.sha)
+    emit(args, ticket_dict(get_ticket(db, args.ticket), load_config(sdir)),
+         "%s merged at %s" % (args.ticket, args.sha))
+
+
+def target_exists(pid, group):
+    try:
+        (os.killpg if group else os.kill)(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def kill_session(row, bare_ok):
+    """Signal the session, but only if `pid` is still provably that session.
+    A group leader gets its whole group signalled (so members that outlive it,
+    such as MCP servers and shells, die too). A non-leader pid is signalled on
+    its own only when `bare_ok`."""
+    pid = row["pid"]
+    if not row_alive(row):
+        return
+    try:
+        group = os.getpgid(pid) == pid
+    except OSError:
+        return
+    if not group and not bare_ok:
+        return
+    send = os.killpg if group else os.kill
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            send(pid, sig)
+        except OSError:
+            return
+        deadline = time.time() + 3.0
+        while time.time() < deadline and target_exists(pid, group):
+            time.sleep(0.05)
+        if not target_exists(pid, group):
+            return
+
+
+def retire_ticket(db, sdir, tid, force, keep_worktree=False):
+    """`retire` without the printing: close, signal, remove the worktree, mark
+    retired. Returns the desktop_archive action, or None."""
+    with transaction(db):
+        row = get_ticket(db, tid)
+        if row["retired_at"] is not None:
+            raise Refusal(EXIT_GATE, "%s is already retired" % tid)
+        if row["phase"] != "done" and not force:
+            raise Refusal(EXIT_GATE, "retire requires phase done (or --force); %s is %s"
+                          % (tid, row["phase"]))
+        # No resume may launch while the session is being closed and removed.
+        marker = claim_launch(db, row, "retire")
+    try:
+        return retire_claimed(db, tid, row, force, keep_worktree, marker)
+    finally:
+        release_launch(db, tid, marker)
+
+
+def retire_claimed(db, tid, row, force, keep_worktree, marker):
+    platform = row_platform(row)
+    ref = row_launch_ref(row) or {}
+    if platform == "headless":
+        kill_session(row, bare_ok=False)
+    else:
+        _, err = platform_close(platform, ref, row["worktree"])
+        if err:
+            print("orch: warning: could not close the %s session of %s: %s"
+                  % (platform, tid, err), file=sys.stderr)
+        kill_session(row, bare_ok=True)
+    if not keep_worktree:
+        # The worktree goes, so does the trust orch gave it.
+        unmark_ticket_trust(db, tid, row["worktree"])
+        remove_worktree(platform, tid, row["worktree"], row_worktree_ref(row), force)
+    with transaction(db):
+        cur = get_ticket(db, tid)
+        if cur["retired_at"] is not None:
+            raise Refusal(EXIT_GATE, "%s is already retired" % tid)
+        db.execute("UPDATE tickets SET retired_at=?, launching=NULL WHERE id=?",
+                   (now(), tid))
+        log_event(db, tid, "retire", cur["phase"], cur["phase"],
+                  " ".join(x for x in ("forced" if force else "",
+                                       "kept-worktree" if keep_worktree else "") if x)
+                  or None)
+    if platform == "desktop":
+        return {"action": "desktop_archive", "ref": ref.get("desktop")}
+    return None
+
+
+def cmd_retire(args, db, sdir):
+    require_platform()
+    action = retire_ticket(db, sdir, args.ticket, args.force, args.keep_worktree)
+    if action:
+        print(json.dumps(action))
+        return
+    emit(args, ticket_dict(get_ticket(db, args.ticket), load_config(sdir)),
+         "%s retired" % args.ticket)
+
+
+cmd_retire.own_tx = True
+
+
+def cmd_events(args, db, sdir):
+    get_ticket(db, args.ticket)
+    evs = [dict(r) for r in db.execute(
+        "SELECT ts, ticket, kind, from_phase, to_phase, detail FROM events"
+        " WHERE ticket=? ORDER BY seq", (args.ticket,))]
+    emit(args, {"events": evs}, "\n".join(
+        "%s\t%s\t%s -> %s\t%s" % (e["ts"], e["kind"], e["from_phase"],
+                                  e["to_phase"], e["detail"] or "") for e in evs))
+
+
+
+
+# ---- watch -------------------------------------------------------------------
+
+def watch_frame(sdir):
+    db = connect(sdir)
+    try:
+        cfg = load_config(sdir)
+        rows = db.execute("SELECT * FROM tickets WHERE retired_at IS NULL"
+                          " ORDER BY seq").fetchall()
+        return [{"id": r["id"], "platform": row_platform(r), "phase": r["phase"],
+                 "health": t["health"], "last_seen_at": r["last_seen_at"],
+                 "review_rounds": r["review_rounds"]}
+                for r, t in ((r, ticket_dict(r, cfg, full=False)) for r in rows)]
+    finally:
+        db.close()
+
+
+def cmd_watch(args):
+    sdir = state_dir()
+    while True:
+        ts = watch_frame(sdir)
+        if args.json:
+            print(json.dumps({"tickets": ts}))
+        else:
+            if not args.once and sys.stdout.isatty():
+                sys.stdout.write("\033[H\033[2J")
+            print("%-24s %-9s %-10s %-8s %-25s %s" % (
+                "TICKET", "PLATFORM", "PHASE", "HEALTH", "LAST ACTIVITY", "ROUNDS"))
+            for t in ts:
+                print("%-24s %-9s %-10s %-8s %-25s %s" % (
+                    t["id"], t["platform"], t["phase"], t["health"],
+                    t["last_seen_at"] or "-", t["review_rounds"]))
+        sys.stdout.flush()
+        if args.once:
+            return
+        try:
+            time.sleep(max(0.2, args.interval))
+        except KeyboardInterrupt:
+            return
+
+
+# ---- selftest ------------------------------------------------------------------
+
+SELFTEST_STEPS = ("preflight", "create", "launch", "report-in", "state", "visible",
+                  "kill", "resume", "teardown", "clean")
+class Terminated(BaseException):
+    """SIGTERM, raised like KeyboardInterrupt so selftest can still clean up."""
+
+
+def raise_terminated(signum, frame):
+    raise Terminated()
+
+
+SELFTEST_BRIEF = ("You are a selftest session. Run `%s phase %s spec`, then stop."
+                  " Do nothing else.")
+
+
+class Selftest:
+    """The selftest as a resumable state machine. Each stage either finishes
+    (records its step and moves on) or, on Desktop, returns an action for the
+    main orchestrator and waits for `--continue`."""
+
+    def __init__(self, db, sdir, state):
+        self.db, self.sdir, self.st = db, sdir, state
+        self.cfg = load_config(sdir)
+
+    # -- bookkeeping --
+    def record(self, name, status, detail=""):
+        self.st["steps"].append({"name": name, "status": status, "detail": str(detail)})
+        if status == "fail" and name not in ("teardown", "clean"):
+            self.st["failed"] = True
+
+    def recorded(self):
+        return {s["name"] for s in self.st["steps"]}
+
+    def row(self):
+        return self.db.execute("SELECT * FROM tickets WHERE id=?",
+                               (self.st["ticket"],)).fetchone()
+
+    def deadline(self):
+        return time.time() + float(self.st["timeout"])
+
+    def poll(self, fn, until):
+        while True:
+            got = fn()
+            if got or time.time() >= until:
+                return got
+            time.sleep(0.2)
+
+    def action(self, name, **extra):
+        self.st["awaiting"] = name
+        out = {"run": self.st["run"], "action": name, "ticket": self.st["ticket"]}
+        out.update(extra)
+        return out
+
+    def take_answer(self, name):
+        """The answer to the pending `name` action, or None."""
+        if self.st.get("awaiting") != name:
+            return None
+        self.st["awaiting"] = None
+        ans = self.st.pop("answer", None)
+        return ans if isinstance(ans, dict) else {}
+
+    def desktop(self):
+        return self.st["platform"] == "desktop"
+
+    def current(self):
+        return next((n for n in SELFTEST_STEPS if n not in self.recorded()), None)
+
+    def step(self, name):
+        return getattr(self, "step_" + name.replace("-", "_"))()
+
+    # -- driver --
+    def run(self):
+        """Advance as far as possible. Returns an action dict, or None when done."""
+        for name in SELFTEST_STEPS:
+            if name in self.recorded():
+                continue
+            if self.st.get("failed") and name not in ("teardown", "clean"):
+                self.record(name, "skip", "an earlier step failed")
+                continue
+            out = self.step(name)
+            if out is not None:
+                return out
+        return None
+
+    def drive(self):
+        """`run`, failing the step in progress on an error and carrying on, so
+        teardown and clean always get their turn."""
+        while True:
+            try:
+                return self.run()
+            except Exception as e:
+                name = self.current()
+                if name is None:
+                    return None
+                self.record(name, "fail", "%s: %s" % (type(e).__name__, e))
+                if name == "clean":
+                    self.safe_purge()
+
+    def interrupted(self, exc):
+        """After Ctrl-C or SIGTERM: fail the step in progress, skip the rest,
+        then teardown and clean, each guarded and never waiting on the main
+        orchestrator."""
+        why = "interrupted (%s)" % ("SIGTERM" if isinstance(exc, Terminated)
+                                    else "SIGINT")
+        self.st["interrupted"] = why
+        self.st["awaiting"] = None
+        name = self.current()
+        if name:
+            self.record(name, "fail", why)
+        for name in SELFTEST_STEPS:
+            if name in self.recorded():
+                continue
+            if name not in ("teardown", "clean"):
+                self.record(name, "skip", why)
+                continue
+            try:
+                out = self.step(name)
+                if out is not None:
+                    self.st["awaiting"] = None
+                    self.record(name, "fail", "%s before the main orchestrator could %s"
+                                % (why, out["action"]))
+            except BaseException as e:  # a second Ctrl-C included
+                if name not in self.recorded():
+                    self.record(name, "fail", "%s: %s" % (type(e).__name__, e))
+        self.safe_purge()
+
+    # -- steps --
+    def step_preflight(self):
+        fails = []
+        try:
+            platform = resolve_platform()
+        except Refusal as e:
+            platform = None
+            fails.append(str(e))
+        self.st["platform"] = platform
+        try:
+            harness = resolve_harness(self.st.get("harness_flag"))[0]
+            if platform:
+                check_harness_platform(harness, platform)
+        except Refusal as e:
+            harness = None
+            fails.append(str(e))
+        self.st["harness"] = harness
+        binary = platform_bin(platform) if platform else None
+        if binary and not shutil.which(binary):
+            fails.append("`%s` is not on PATH" % binary)
+        if harness and (platform == "headless" or harness != "claude") \
+                and not shutil.which(harness_bin(harness)):
+            fails.append("`%s` is not on PATH" % harness_bin(harness))
+        try:
+            main = main_checkout()
+            if not read_base_branch(os.path.join(main, ".env")):
+                fails.append("BASE_BRANCH is not set in %s" % os.path.join(main, ".env"))
+        except Refusal as e:
+            fails.append(str(e))
+        if fails:
+            self.record("preflight", "fail", "; ".join(fails))
+        else:
+            self.record("preflight", "pass", "platform %s, harness %s" % (platform, harness))
+
+    def step_create(self):
+        tid = self.st["ticket"]
+        if self.st["platform"] == "herdr" and "main_ws_open" not in self.st:
+            # `herdr worktree open` (launch) opens a workspace for the main
+            # checkout when none is open; teardown closes only one it opened.
+            # Unknown counts as open: never close what we cannot prove we opened.
+            try:
+                self.st["main_ws_open"] = herdr_main_workspace(main_checkout()) is not None
+            except ToolError as e:
+                self.st["main_ws_open"] = True
+                self.st["main_ws_note"] = ("main checkout workspace state unknown before"
+                                           " launch, left open: %s" % e)
+        with transaction(self.db):
+            self.db.execute("INSERT INTO tickets (id, title, phase, created_at)"
+                            " VALUES (?,?,?,?)", (tid, "orch selftest", "ready", now()))
+            log_event(self.db, tid, "add", None, "ready", "selftest run %s"
+                      % self.st["run"])
+        self.st["created"] = True
+        main = main_checkout()
+        before = git_branches(main)
+        # Known before create runs, so teardown finds what an interrupted or
+        # half-failed create left behind.
+        self.st["wt_name"] = name = worktree_name(tid)
+        self.st["branch_existed"] = name in before
+        try:
+            wt, wref = create_worktree(self.st["platform"], tid)
+        except Refusal as e:
+            return self.record("create", "fail", e)
+        self.st["wt"], self.st["wref"] = wt, wref
+        branch = git_branch_of(wt)
+        self.st["branch"] = branch
+        if not os.path.isdir(wt) or wt not in git_worktrees(main):
+            return self.record("create", "fail", "%s is not a git worktree" % wt)
+        if not branch or branch in before:
+            return self.record("create", "fail", "%s is not on a new branch (%s)"
+                               % (wt, branch))
+        self.record("create", "pass", "%s on branch %s" % (wt, branch))
+
+    def step_launch(self):
+        ans = self.take_answer("desktop_start")
+        if ans is not None:
+            if ans.get("ok") is False:
+                return self.record("launch", "fail", ans.get("detail")
+                                   or "the main orchestrator could not start it")
+            if ans.get("ref"):
+                with transaction(self.db):
+                    self.db.execute("UPDATE tickets SET launch_ref=? WHERE id=?",
+                                    (json.dumps({"desktop": ans["ref"]}),
+                                     self.st["ticket"]))
+            return self.record("launch", "pass", "desktop session started")
+        tid = self.st["ticket"]
+        try:
+            try:
+                out, is_action = spawn_ticket(
+                    self.db, self.sdir, self.cfg, tid,
+                    SELFTEST_BRIEF % (shlex.quote(os.path.realpath(__file__)), tid),
+                    self.st["platform"], self.st["wt"], self.st.get("wref"),
+                    harness=self.st.get("harness") or "claude")
+            finally:
+                self.note_main_ws_opened()
+        except TrustBlocked as e:
+            self.st["trust"] = str(e)
+            self.st["sid"] = self.row()["session_id"]
+            return self.record("launch", "pass", "launched; blocked at folder trust")
+        except Refusal as e:
+            return self.record("launch", "fail", e)
+        self.st["sid"] = self.row()["session_id"]
+        if is_action:
+            return self.action(out.pop("action"), **out)
+        self.record("launch", "pass", "session %s" % (
+            self.st["sid"] or "id pending (Codex names it at SessionStart)"))
+
+    def step_report_in(self):
+        if self.st.get("trust"):
+            return self.record("report-in", "fail", self.st["trust"])
+
+        def seen():
+            r = self.row()
+            return r["session_seen"] and r["pid"] and \
+                health(r, row_alive(r), self.cfg) != "none"
+        if self.poll(seen, self.deadline()):
+            r = self.row()
+            self.st["sid"] = r["session_id"]
+            return self.record("report-in", "pass", "pid %s" % r["pid"])
+        self.record("report-in", "fail",
+                    "no SessionStart hook from the session within %ss; is the"
+                    " orchestration plugin enabled for it?" % self.st["timeout"])
+
+    def step_state(self):
+        if self.poll(lambda: self.row()["phase"] == "spec", self.deadline()):
+            return self.record("state", "pass", "phase spec")
+        self.record("state", "fail", "the session did not run `orch phase %s spec`"
+                    " (phase %s); check its permissions" % (self.st["ticket"],
+                                                            self.row()["phase"]))
+
+    def check_visible(self, name, want):
+        ans = self.take_answer("desktop_check")
+        if self.desktop():
+            if ans is None:
+                r = self.row()
+                return self.action("desktop_check", cwd=self.st.get("wt"),
+                                   title="t" + self.st["ticket"],
+                                   ref=(row_launch_ref(r) or {}).get("desktop")
+                                   if r else None), None
+            v = {"worktree": bool(ans.get("worktree")),
+                 "session": bool(ans.get("session")), "detail": ans.get("detail", "")}
+        else:
+            r = self.row()
+            if r is None:
+                return None, (False, "ticket row missing")
+            v = visible(self.st["platform"], r)
+        ok = all(v[k] is not None and bool(v[k]) == want for k in ("worktree", "session"))
+
+        def word(x):
+            return "unknown" if x is None else x
+        return None, (ok, "worktree=%s session=%s %s" % (
+            word(v["worktree"]), word(v["session"]), v.get("detail") or ""))
+
+    def step_visible(self):
+        act, res = self.check_visible("visible", True)
+        if act:
+            return act
+        self.record("visible", "pass" if res[0] else "fail", res[1])
+
+    def step_kill(self):
+        if self.desktop():
+            ans = self.take_answer("desktop_stop")
+            if ans is None:
+                return self.action("desktop_stop",
+                                   ref=(row_launch_ref(self.row()) or {}).get("desktop"))
+        else:
+            kill_session(self.row(), bare_ok=True)
+        self.st["killed_pid"] = self.row()["pid"]
+        dead = self.poll(lambda: health(self.row(), row_alive(self.row()), self.cfg)
+                         == "dead", self.deadline())
+        stale = is_stale(self.row(), row_alive(self.row()), self.cfg)
+        if dead and stale:
+            return self.record("kill", "pass", "health dead, listed by stale")
+        self.record("kill", "fail", "health %s, stale %s" % (
+            health(self.row(), row_alive(self.row()), self.cfg), stale))
+
+    def step_resume(self):
+        if self.st.get("awaiting") != "desktop_resume":
+            try:
+                out, is_action = resume_ticket(self.db, self.sdir, self.cfg,
+                                               self.st["ticket"])
+            except TrustBlocked as e:
+                return self.record("resume", "fail", e)
+            except Refusal as e:
+                return self.record("resume", "fail", e)
+            if is_action:
+                return self.action(out.pop("action"), **out)
+        else:
+            self.take_answer("desktop_resume")
+
+        def back():
+            r = self.row()
+            return (r["session_id"] == self.st["sid"] and r["activity"] is not None
+                    and row_alive(r))
+        if self.poll(back, self.deadline()):
+            return self.record("resume", "pass", "session %s alive again, pid %s"
+                               % (self.st["sid"], self.row()["pid"]))
+        self.record("resume", "fail", "no SessionStart for session %s after resume"
+                    % self.st.get("sid"))
+
+    def step_teardown(self):
+        if self.st["keep"]:
+            return self.record("teardown", "skip", "--keep")
+        if not self.st.get("created"):
+            return self.record("teardown", "skip", "nothing was created")
+        ans = self.take_answer("desktop_archive")
+        if ans is not None:
+            if ans.get("ok") is False:
+                return self.record("teardown", "fail", ans.get("detail")
+                                   or "the main orchestrator could not archive it")
+            return self.record("teardown", "pass", "retired; desktop session archived")
+        r = self.row()
+        try:
+            if r is not None and r["session_id"] and not self.st.get("sid"):
+                self.st["sid"] = r["session_id"]
+            if r is None or not r["worktree"]:
+                # A failed launch restores worktree to NULL: retire alone
+                # would leave the worktree, branch and DDEV project behind.
+                self.remove_orphan(r)
+            if r is not None and r["retired_at"] is None:
+                act = retire_ticket(self.db, self.sdir, self.st["ticket"], force=True)
+                if act and self.desktop() and act.get("ref") \
+                        and not self.st.get("interrupted"):
+                    return self.action("desktop_archive", ref=act["ref"])
+        except Refusal as e:
+            notes = [str(e)] + self.close_main_workspace()
+            return self.record("teardown", "fail", "; ".join(notes))
+        notes = self.close_main_workspace()
+        self.record("teardown", "fail" if self.st.get("main_ws_close_failed") else "pass",
+                    "; ".join(["retired --force"] + notes))
+
+    def note_main_ws_opened(self):
+        """After the launch: record the id of the main checkout's Herdr
+        workspace when none was open before, so teardown closes only that
+        one. Without an id nothing is closed."""
+        if self.st["platform"] != "herdr" or self.st.get("main_ws_open") is not False \
+                or "main_ws_opened_id" in self.st:
+            return
+        try:
+            self.st["main_ws_opened_id"] = herdr_main_workspace(main_checkout())
+        except ToolError as e:
+            self.st["main_ws_opened_id"] = None
+            self.st["main_ws_note"] = ("main checkout workspace state unknown after"
+                                       " launch, left open: %s" % e)
+
+    def close_main_workspace(self):
+        """Close the main checkout's Herdr workspace if this run opened it:
+        only the id recorded after the launch, and only while it is still the
+        main checkout's. Returns notes for the teardown detail."""
+        if self.st.get("main_ws_note"):
+            return [self.st["main_ws_note"]]
+        opened = self.st.get("main_ws_opened_id")
+        if self.st["platform"] != "herdr" or self.st.get("main_ws_open") is not False \
+                or not opened:
+            return []
+        try:
+            ws = herdr_main_workspace(main_checkout())
+            if ws != opened:
+                return []
+            call_tool("herdr", ["workspace", "close", ws])
+        except ToolError as e:
+            self.st["main_ws_close_failed"] = True
+            return ["could not close the main checkout workspace selftest opened: %s" % e]
+        return ["closed main checkout workspace %s (opened by selftest)" % ws]
+
+    def remove_orphan(self, r):
+        """Remove the selftest worktree the ticket row does not name."""
+        platform = self.st["platform"]
+        main = main_checkout()
+        name = self.st.get("wt_name")
+        wt = self.st.get("wt")
+        if not wt and name:
+            found = [w for w in git_worktrees(main)[1:] if os.path.basename(w) == name]
+            wt = found[0] if found else None
+        if wt:
+            self.st.setdefault("wt", wt)
+            if r is not None:
+                platform_close(row_platform(r), row_launch_ref(r), wt)
+                unmark_ticket_trust(self.db, self.st["ticket"], wt)
+            remove_worktree(platform, self.st["ticket"], wt, self.st.get("wref"),
+                            force=True)
+        if name and not self.st.get("branch_existed") and name in git_branches(main) \
+                and name not in (git_branch_of(w) for w in git_worktrees(main)):
+            subprocess.run(["git", "-C", main, "branch", "-D", name],
+                           capture_output=True)
+            self.st.setdefault("branch", name)
+
+    def step_clean(self):
+        if self.st["keep"]:
+            return self.record("clean", "skip", "--keep")
+        if not self.st.get("created"):
+            return self.record("clean", "skip", "nothing was created")
+        problems, notes = [], []
+        r = self.row()
+        if r is not None and self.st.get("wt"):
+            if self.desktop() and self.st.get("interrupted"):
+                problems.append("visibility not checked: %s" % self.st["interrupted"])
+            else:
+                act, res = self.check_visible("clean", False)
+                if act:
+                    return act
+                if not res[0]:
+                    problems.append("still visible: " + res[1])
+        # The row, read before it is purged, has the session id even when
+        # launch never recorded one in the run state (folder trust).
+        sid = self.st.get("sid") or (r["session_id"] if r is not None else None)
+        trusted = {e["detail"] for e in self.db.execute(
+            "SELECT detail FROM events WHERE ticket=? AND kind='trust_mark'",
+            (self.st["ticket"],))}
+        try:
+            for path in sorted(p for p in trusted if p):
+                if path.startswith("codex "):
+                    path = path[len("codex "):]
+                    cfg = os.path.join(codex_home(), "config.toml")
+                    try:
+                        with open(cfg, encoding="utf-8") as f:
+                            text = f.read()
+                    except FileNotFoundError:
+                        text = ""
+                    except (OSError, ValueError) as e:
+                        problems.append("codex folder-trust state unknown: %s" % e)
+                        continue
+                    if codex_trust_block(path) in text:
+                        problems.append("folder-trust entry for %s still in %s"
+                                        % (path, cfg))
+                    continue
+                try:
+                    if is_trusted(path):
+                        problems.append("folder-trust entry for %s still in %s"
+                                        % (path, claude_json_path()))
+                except TrustError as e:
+                    problems.append("folder-trust entry state unknown: %s" % e)
+            if sid:
+                left = self.poll(lambda: not session_processes(sid), time.time() + 5)
+                if not left:
+                    problems.append("processes still running for session %s: %s"
+                                    % (sid, session_processes(sid)))
+            main = main_checkout()
+            wt, branch = self.st.get("wt"), self.st.get("branch")
+            if not branch and not self.st.get("branch_existed"):
+                branch = self.st.get("wt_name")
+            if wt and (os.path.exists(wt) or wt in git_worktrees(main)):
+                problems.append("worktree %s still exists" % wt)
+            if branch and branch in git_branches(main):
+                problems.append("branch %s still exists" % branch)
+            if self.st["platform"] == "herdr" and self.st.get("main_ws_open") is False:
+                opened = self.st.get("main_ws_opened_id")
+                try:
+                    ws = herdr_main_workspace(main) if opened else None
+                except ToolError as e:
+                    problems.append("main checkout workspace state unknown: %s" % e)
+                else:
+                    if ws and ws == opened:
+                        problems.append("Herdr workspace %s for the main checkout,"
+                                        " opened by selftest, still open" % ws)
+            elif self.st["platform"] == "herdr" and self.st.get("main_ws_open"):
+                # Open before selftest: not ours, never touched; only noted.
+                try:
+                    if herdr_main_workspace(main) is None:
+                        notes.append("main checkout workspace, open before selftest,"
+                                     " is no longer open")
+                except ToolError:
+                    pass
+            if wt:
+                try:
+                    ddev = ddev_project_at(wt)
+                except ToolError as e:
+                    problems.append("DDEV state unknown: %s" % e)
+                else:
+                    if ddev:
+                        problems.append("DDEV project %s still exists" % ddev)
+        finally:
+            self.purge()
+        if problems:
+            return self.record("clean", "fail", "; ".join(problems))
+        self.record("clean", "pass", "; ".join(["nothing left"] + notes))
+
+    def safe_purge(self):
+        try:
+            self.purge()
+        except BaseException as e:
+            print("orch: warning: could not delete the selftest ticket %s: %s"
+                  % (self.st["ticket"], e), file=sys.stderr)
+
+    def purge(self):
+        tid = self.st["ticket"]
+        with transaction(self.db):
+            for table, col in (("tickets", "id"), ("events", "ticket"),
+                               ("ci_results", "ticket")):
+                self.db.execute("DELETE FROM %s WHERE %s=?" % (table, col), (tid,))
+        for path in (os.path.join(self.sdir, "briefs", tid + ".md"),
+                     os.path.join(self.sdir, "briefs", tid + ".resume.md"),
+                     log_path(self.sdir, tid)):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+def session_processes(sid):
+    """Pids of processes with `sid` as a word on their command line."""
+    try:
+        p = subprocess.run(["ps", "-ax", "-ww", "-o", "pid=,command="],
+                           capture_output=True, text=True, timeout=10, env=ps_env())
+    except (OSError, subprocess.SubprocessError):
+        return []
+    out = []
+    for line in p.stdout.splitlines():
+        parts = line.split()
+        if len(parts) > 1 and sid in parts[1:] and parts[0] != str(os.getpid()):
+            out.append(int(parts[0]))
+    return out
+
+
+def ddev_project_at(path):
+    """Name of a DDEV project rooted at `path`, if ddev knows one; None also
+    when ddev is not installed. Raises ToolError when ddev cannot tell."""
+    if not shutil.which("ddev"):
+        return None
+    try:
+        p = subprocess.run(["ddev", "list", "--json-output"], capture_output=True,
+                           text=True, timeout=60, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise ToolError("`ddev list`: %s" % e)
+    try:
+        data = json.loads(p.stdout)
+    except ValueError:
+        data = None
+    if p.returncode != 0 or not isinstance(data, dict):
+        raise ToolError("`ddev list` exited %d: %s" % (
+            p.returncode, (p.stderr.strip() or p.stdout.strip())[:300]))
+    for proj in (data.get("raw") or []) if isinstance(data, dict) else []:
+        if isinstance(proj, dict) and realpath_or_none(proj.get("approot")) == path:
+            return proj.get("name") or path
+    return None
+
+
+def save_run(db, st):
+    with transaction(db):
+        db.execute("INSERT OR REPLACE INTO selftest_runs (run, state, updated_at)"
+                   " VALUES (?,?,?)", (st["run"], json.dumps(st), now()))
+
+
+def cmd_selftest(args):
+    sdir = state_dir()
+    db = connect(sdir)
+    try:
+        if args.cont:
+            got = db.execute("SELECT state FROM selftest_runs WHERE run=?",
+                             (args.cont,)).fetchone()
+            if got is None:
+                raise Refusal(EXIT_NOT_FOUND, "no selftest run %s" % args.cont)
+            st = json.loads(got["state"])
+            try:
+                answer = json.loads(args.answer or "{}")
+            except ValueError as e:
+                raise Refusal(EXIT_USAGE, "--answer is not JSON: %s" % e)
+            st["answer"] = answer
+        else:
+            run = uuid.uuid4().hex[:8]
+            st = {"run": run, "ticket": "selftest-" + uuid.uuid4().hex[:8],
+                  "platform": None, "timeout": args.timeout, "keep": args.keep,
+                  "steps": [], "failed": False, "harness_flag": args.harness}
+        test = Selftest(db, sdir, st)
+        stop = None
+        try:
+            old_term = signal.signal(signal.SIGTERM, raise_terminated)
+        except ValueError:  # not the main thread
+            old_term = None
+        try:
+            try:
+                out = test.drive()
+            except (KeyboardInterrupt, Terminated) as e:
+                stop, out = e, None
+                test.interrupted(e)
+        finally:
+            if old_term is not None:
+                signal.signal(signal.SIGTERM, old_term)
+        if out is not None:
+            save_run(db, st)
+            print(json.dumps(out))
+            return 0
+        if stop is not None:
+            save_run(db, st)  # kept: the record of an interrupted run
+        else:
+            with transaction(db):
+                db.execute("DELETE FROM selftest_runs WHERE run=?", (st["run"],))
+        ok = stop is None and all(
+            s["status"] == "pass" or (s["status"] == "skip" and st["keep"]
+                                      and s["name"] in ("teardown", "clean"))
+            for s in st["steps"])
+        result = {"run": st["run"], "platform": st["platform"],
+                  "harness": st.get("harness"), "steps": st["steps"], "ok": ok}
+        if stop is not None:
+            result["interrupted"] = st["interrupted"]
+        if args.json:
+            print(json.dumps(result))
+        else:
+            for s in st["steps"]:
+                print("[%s] %s%s" % (s["status"], s["name"],
+                                     (": " + s["detail"]) if s["detail"] else ""))
+            print("selftest %s on %s (%s): %s" % (st["run"], st["platform"],
+                                                  st.get("harness"),
+                                                  "ok" if ok else "FAILED"))
+        if stop is not None:
+            return 143 if isinstance(stop, Terminated) else 130
+        return 0 if ok else EXIT_GATE
+    finally:
+        db.close()
+
+
+# ---- hook ------------------------------------------------------------------
+
+# Script runtimes that run claude as a script file (npm installs:
+# `node .../bin/claude`). Shells are not among them: `zsh -lc claude` is a shell.
+INTERPRETER = re.compile(r"(node|bun|deno|python[0-9.]*)\Z")
+# Runtime options that run code from an argument, not a script file.
+CODE_OPTIONS = re.compile(r"-[A-Za-z]*[cem][A-Za-z]*\Z|--eval\Z|--print\Z")
+
+
+def agent_of(comm, command):
+    """The harness a process with executable `comm` and command line `command`
+    is, or None. A harness process's executable is named after it (`claude`,
+    `pi`, `codex`; Pi sets its process title to `pi`), or lives in Claude's
+    native installer `.../claude/versions/<version>`, or the command runs it
+    directly or as an interpreter's script."""
+    if comm and "/claude/versions/" in comm:
+        return "claude"
+    if comm and os.path.basename(comm) in HARNESSES:
+        return os.path.basename(comm)
+    words = command.split()
+    if not words:
+        return None
+    if os.path.basename(words[0]) in HARNESSES:
+        return os.path.basename(words[0])
+    if INTERPRETER.match(os.path.basename(words[0]).lower()):
+        for w in words[1:]:
+            if not w.startswith("-"):
+                name = os.path.basename(w)
+                return name if name in HARNESSES else None
+            if CODE_OPTIONS.match(w):  # `python -m claude`, `node -e ...`
+                return None
+    return None
+
+
+def is_claude(comm, command):
+    return agent_of(comm, command) == "claude"
+
+
+def walk_to_agent(pid, levels=8):
+    """(pid, harness) of the first harness process from `pid` up (at most
+    `levels` processes), or (None, None)."""
+    for _ in range(levels):
+        if pid <= 1:
+            return None, None
+        # `comm` is the executable path, which may contain spaces (Claude
+        # Desktop's lives under "Application Support"): keep it last.
+        try:
+            p = subprocess.run(["ps", "-o", "ppid=,comm=", "-p", str(pid)],
+                               capture_output=True, text=True, timeout=3, env=ps_env())
+        except (OSError, subprocess.SubprocessError):
+            return None, None
+        parts = p.stdout.strip().split(None, 1)
+        if p.returncode != 0 or not parts:
+            return None, None
+        comm = parts[1].strip() if len(parts) > 1 else ""
+        harness = agent_of(comm, ps_field(pid, "command") or "")
+        if harness:
+            return pid, harness
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            return None, None
+    return None, None
+
+
+def hook_claude_pid():
+    """The agent process this hook runs under: the pid the Pi extension names
+    (ORCH_HOOK_AGENT_PID), else walk up from our parent (at most 8 levels) to
+    the first harness process."""
+    for var in ("ORCH_HOOK_CLAUDE_PID", "ORCH_HOOK_AGENT_PID"):
+        forced = os.environ.get(var)
+        if forced:
+            if forced == "none":  # test override: the walk found nothing
+                return None
+            try:
+                return int(forced)
+            except ValueError:
+                return None
+    return walk_to_agent(os.getppid())[0]
+
+
+def hook_locate(cwd):
+    """(state dir, cwd is in the main checkout) for the hook's cwd; the state
+    dir is None when there is none."""
+    git = ["git", "-C", cwd, "rev-parse"]
+    p = subprocess.run(git + ["--path-format=absolute", "--git-common-dir",
+                              "--show-toplevel"],
+                       capture_output=True, text=True, timeout=5)
+    if p.returncode != 0:
+        p = subprocess.run(git + ["--git-common-dir", "--show-toplevel"],
+                           capture_output=True, text=True, timeout=5)
+    lines = p.stdout.splitlines() if p.returncode == 0 else []
+    in_main = False
+    main = None
+    if len(lines) >= 2:
+        common = lines[0].strip()
+        if not os.path.isabs(common):
+            common = os.path.join(cwd, common)
+        main = os.path.dirname(os.path.realpath(common))
+        in_main = os.path.realpath(lines[1].strip()) == main
+    home = os.environ.get("ORCH_HOME")
+    if home:
+        return os.path.abspath(home), in_main
+    if main is None:
+        return None, False
+    return os.path.join(main, ".agents", "orchestration"), in_main
+
+
+def hook_skip(event, sid, row, pid):
+    """True if this hook must leave `row` alone."""
+    if event == "SessionStart":
+        if row["phase"] == "done":
+            return True
+        if sid == row["session_id"]:
+            return False
+        # Until the launched session has reported in, nobody else may take a
+        # headless/orca/herdr ticket over: its own SessionStart is on the way.
+        if not row["session_seen"] and row_platform(row) != "desktop":
+            if row["session_id"] is None and row_harness(row) == "codex":
+                # Codex names its thread only in this hook. Headless: only the
+                # process orch launched; orca/herdr: the first one to report.
+                if row_platform(row) == "headless":
+                    return pid is None or pid != row["pid"]
+                return False
+            return True
+        # A different session takes over only from a dead one, or from the
+        # same process (`/clear` starts a new session id in place).
+        return row_alive(row) and (pid is None or pid != row["pid"])
+    if sid != row["session_id"]:
+        return True
+    if event == "PostToolUse":
+        age = age_s(row["last_seen_at"])
+        return (row["activity"] == "working" and age is not None
+                and age < POST_TOOL_THROTTLE_S)
+    return False
+
+
+HOOK_KEY_COLUMNS = ("phase", "worktree", "retired_at", "session_id", "pid",
+                    "pid_start", "activity", "last_seen_at", "session_seen", "platform")
+
+
+def run_hook():
+    payload = json.loads(sys.stdin.read())
+    if not isinstance(payload, dict):
+        return
+    event = payload.get("hook_event_name")
+    sid = payload.get("session_id")
+    cwd = payload.get("cwd")
+    if event not in HOOK_EVENTS or not isinstance(sid, str) or not sid \
+            or not isinstance(cwd, str) or not cwd:
+        return
+    cwd = os.path.realpath(cwd)
+    if not os.path.isdir(cwd):
+        return
+    sdir, in_main = hook_locate(cwd)
+    if in_main or not sdir or not os.path.isfile(os.path.join(sdir, "state.db")):
+        return
+    out = None
+    db = connect(sdir, timeout=2)
+    try:
+        # Match under a plain read; most hooks end here without a write lock.
+        rows = db.execute("SELECT * FROM tickets WHERE retired_at IS NULL"
+                          " AND worktree IS NOT NULL").fetchall()
+        matches = [r for r in rows if contains(r["worktree"], cwd)]
+        if not matches:
+            return
+        row = max(matches, key=lambda r: (len(r["worktree"]),
+                                          r["phase"] != "done", r["seq"]))
+        tid = row["id"]
+        pid = pid_start = None
+        if event == "SessionStart" and row["phase"] != "done":
+            pid = hook_claude_pid()
+            pid_start = ps_field(pid, "lstart") if pid else None
+            if pid_start is None:
+                pid = None  # no start time: as good as finding nothing
+        if event == "SessionStart" and row["session_id"] is None \
+                and row_harness(row) == "codex" and row_platform(row) == "headless" \
+                and row["pid"] is None and row["launching"]:
+            # The launch records the pid it started right after starting it.
+            deadline = time.time() + 3
+            while time.time() < deadline and row is not None and row["pid"] is None \
+                    and row["launching"]:
+                time.sleep(0.1)
+                row = db.execute("SELECT * FROM tickets WHERE id=?", (tid,)).fetchone()
+        if hook_skip(event, sid, row, pid):
+            return
+        with transaction(db):
+            cur = db.execute("SELECT * FROM tickets WHERE id=?", (tid,)).fetchone()
+            if cur is None or cur["retired_at"] is not None \
+                    or cur["worktree"] != row["worktree"]:
+                return
+            if any(cur[c] != row[c] for c in HOOK_KEY_COLUMNS) \
+                    and hook_skip(event, sid, cur, pid):
+                return
+            ts, phase = now(), cur["phase"]
+            if event == "SessionStart":
+                if sid == cur["session_id"]:
+                    # Same session: a failed walk keeps the recorded process.
+                    db.execute(
+                        "UPDATE tickets SET pid=COALESCE(?, pid), pid_start=CASE WHEN"
+                        " ? IS NULL THEN pid_start ELSE ? END, session_seen=1,"
+                        " activity='working', last_seen_at=? WHERE id=?",
+                        (pid, pid, pid_start, ts, tid))
+                else:
+                    db.execute(
+                        "UPDATE tickets SET session_id=?, pid=?, pid_start=?,"
+                        " session_seen=1, activity='working', last_seen_at=? WHERE id=?",
+                        (sid, pid, pid_start, ts, tid))
+                    log_event(db, tid, "attach", phase, phase, "session=%s source=%s"
+                              % (sid, payload.get("source")))
+                out = ("You are the ticket orchestrator for %s. Run `orch show %s`"
+                       " before anything else." % (tid, tid))
+            elif event == "PostToolUse":
+                db.execute("UPDATE tickets SET activity='working', last_seen_at=?"
+                           " WHERE id=?", (ts, tid))
+            elif event == "Stop":
+                db.execute("UPDATE tickets SET activity='idle', last_seen_at=?"
+                           " WHERE id=?", (ts, tid))
+            else:
+                db.execute("UPDATE tickets SET activity='ended', last_seen_at=?"
+                           " WHERE id=?", (ts, tid))
+                log_event(db, tid, "session_end", phase, phase,
+                          "reason=%s" % payload.get("reason"))
+    finally:
+        db.close()
+    if out:
+        print(out)
+
+
+def cmd_hook(args):
+    """Never disturbs the session: always exit 0, silent on any error."""
+    try:
+        run_hook()
+    except BaseException:
+        pass
+
+
+# ---- parser ----------------------------------------------------------------
+
+def build_parser():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", help="print one JSON object")
+    p = argparse.ArgumentParser(prog="orch", parents=[common],
+                                description="Orchestration state CLI")
+    sub = p.add_subparsers(dest="cmd", metavar="command")
+    sub.required = True
+
+    def add(name, fn, *ticket_args):
+        sp = sub.add_parser(name, parents=[common])
+        sp.set_defaults(fn=fn)
+        for a in ticket_args:
+            sp.add_argument(a)
+        return sp
+
+    add("init", cmd_init)
+    add("platform", cmd_platform)
+    add("preflight", cmd_preflight)
+    sp = add("add", cmd_add, "ticket")
+    sp.add_argument("--title", required=True)
+    sp.add_argument("--url")
+    add("list", cmd_list)
+    add("show", cmd_show, "ticket")
+    add("next", cmd_next)
+    sp = add("spawn", cmd_spawn, "ticket")
+    sp.add_argument("--worktree")
+    sp.add_argument("--brief-file", required=True)
+    sp.add_argument("--platform", choices=PLATFORMS)
+    sp.add_argument("--harness", choices=HARNESSES)
+    sp = add("resume", cmd_resume, "ticket")
+    sp.add_argument("--note")
+    sp.add_argument("--platform", choices=PLATFORMS)
+    sp.add_argument("--harness", choices=HARNESSES)
+    sp = add("attach", cmd_attach, "ticket")
+    sp.add_argument("--ref")
+    sp.add_argument("--session-id")
+    add("stale", cmd_stale)
+    add("hook", cmd_hook)
+    sp = add("phase", cmd_phase, "ticket")
+    sp.add_argument("phase", choices=sorted(PHASE_STATUS))
+    sp.add_argument("--note")
+    sp = add("block", cmd_block, "ticket")
+    sp.add_argument("--reason", required=True)
+    add("unblock", cmd_unblock, "ticket")
+    sp = add("ci", cmd_ci, "ticket")
+    sp.add_argument("--sha", required=True)
+    g = sp.add_mutually_exclusive_group(required=True)
+    g.add_argument("--passed", action="store_true")
+    g.add_argument("--failed", action="store_true")
+    sp = add("merged", cmd_merged, "ticket")
+    sp.add_argument("--sha", required=True)
+    sp = add("retire", cmd_retire, "ticket")
+    sp.add_argument("--force", action="store_true")
+    sp.add_argument("--keep-worktree", action="store_true")
+    add("events", cmd_events, "ticket")
+    sp = add("watch", cmd_watch)
+    sp.add_argument("--interval", type=float, default=5.0)
+    sp.add_argument("--once", action="store_true")
+    sp = add("selftest", cmd_selftest)
+    sp.add_argument("--harness", choices=HARNESSES)
+    sp.add_argument("--keep", action="store_true")
+    sp.add_argument("--timeout", type=float, default=180.0)
+    sp.add_argument("--continue", dest="cont", metavar="RUN")
+    sp.add_argument("--answer")
+    return p
+
+
+READ_ONLY = (cmd_list, cmd_show, cmd_next, cmd_stale, cmd_events)
+NO_DB = (cmd_init, cmd_preflight, cmd_platform, cmd_hook, cmd_watch,
+         cmd_selftest)
+
+
+def main(argv=None):
+    if (argv if argv is not None else sys.argv[1:])[:1] == ["hook"]:
+        cmd_hook(None)
+        return 0
+    args = build_parser().parse_args(argv)
+    try:
+        if args.fn in NO_DB:
+            return args.fn(args) or 0
+        sdir = state_dir()
+        db = connect(sdir)
+        try:
+            if getattr(args.fn, "own_tx", False):
+                args.fn(args, db, sdir)
+            else:
+                with transaction(db, write=args.fn not in READ_ONLY):
+                    args.fn(args, db, sdir)
+        finally:
+            db.close()
+        return 0
+    except Refusal as e:
+        print("orch: %s" % e, file=sys.stderr)
+        return e.code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

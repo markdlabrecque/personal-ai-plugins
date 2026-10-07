@@ -1,0 +1,9 @@
+{
+  "name": "orchestration",
+  "version": "0.6.2",
+  "description": "Run coding tickets end to end: one worktree and headless orchestrator session per ticket, a TDD stage-agent pipeline, squash-merge on green CI, and SQLite state that survives crashes.",
+  "author": {
+    "name": "Mark Labrecque",
+    "email": "mark@affinitybridge.com"
+  }
+}
