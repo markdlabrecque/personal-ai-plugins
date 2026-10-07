@@ -87,7 +87,32 @@ fi
 
 # Env vars a developer's own shell might export that would change what the
 # engine does. Scrubbed (`env -u`) from every case before its own settings.
-SCRUB=(-u PROVISION_HOOK -u MAIN_REPO_OVERRIDE -u WORKTREE_ROOT -u BASE_BRANCH -u DB_DUMP)
+SCRUB=(-u PROVISION_HOOK -u MAIN_REPO_OVERRIDE -u WORKTREE_ROOT -u BASE_BRANCH -u DB_DUMP
+  -u PROJECT_NAME -u MAIN_CHECKOUT)
+
+# Each case dir is a project root under ORCH_PROJECTS_DIR=$SANDBOX. The engine
+# is copied into the case, so it is pointed at the real resolver.
+export ORCH_PROJECTS_DIR="$SANDBOX"
+export ORCH_PROJECT_LIB="$(cd "$SKILL_DIR/../.." && pwd -P)/scripts/orch-project.sh"
+
+# write_orch <case-dir> [extra lines] -- .orch naming the project acme-site,
+# with MAIN_CHECKOUT pointing at the case's one main checkout.
+write_orch() {
+  local root="$1" main d
+  for d in "$root"/*/; do
+    [ -d "$d.git" ] && main="$(basename "$d")"
+  done
+  printf 'PROJECT_NAME=acme-site\nMAIN_CHECKOUT=%s\n%s\n' "${main:-acme-site}" "${2-}" > "$root/.orch"
+}
+
+# install_engine <dest> -- copy the engine to <dest> and give its case (the
+# folder directly under $SANDBOX) a .orch if it has none yet.
+install_engine() {
+  local rest="${1#"$SANDBOX"/}" root
+  root="$SANDBOX/${rest%%/*}"
+  cp "$SCRIPT" "$1" || return 1
+  [ -f "$root/.orch" ] || write_orch "$root"
+}
 
 # ---------------------------------------------------------------------------
 # Stub PATH. ddev is a no-op; `ddev mysql -Nse 'SHOW TABLES'` prints nothing so
@@ -169,10 +194,9 @@ run_case() {
   git -C "$dir/acme-site" add README.md composer.json >/dev/null 2>&1 || return 1
   git -C "$dir/acme-site" -c user.email=t@t -c user.name=t \
     commit -q -m init >/dev/null 2>&1 || return 1
-  cp "$SCRIPT" "$dir/acme-site/setup-worktree.sh" || return 1
-  # Optional per-case .env. Unset means the repo has no .env at all, which is
-  # its own branch of the resolution.
-  [ -n "${CASE_DOTENV-}" ] && printf '%s\n' "$CASE_DOTENV" > "$dir/acme-site/.env"
+  install_engine "$dir/acme-site/setup-worktree.sh" || return 1
+  # Optional per-case .orch lines (CASE_DOTENV, named for its old home).
+  write_orch "$dir" "${CASE_DOTENV-}"
   printf "%s\n" "$name" > "$dir/CASE"
 
   DDEV_LOG_FILE="$dir/ddev.log"; : > "$DDEV_LOG_FILE"
@@ -181,7 +205,7 @@ run_case() {
 
   # Every case gets a non-existent-dump DB_DUMP by default, so an unrelated
   # case never accidentally triggers a real import. A case that needs DB_DUMP
-  # genuinely UNSET (to reach the main-checkout .env fallback -- see AC3)
+  # genuinely UNSET (to reach the .orch fallback -- see AC3)
   # sets CASE_UNSET_DB_DUMP=1.
   local db_dump_default=(DB_DUMP="$dir/no-such-dump.sql.gz")
   if [ "${CASE_UNSET_DB_DUMP-0}" = "1" ]; then
@@ -245,9 +269,10 @@ run_provision_case() {
 
   local wt="$dir/wt"
   git -C "$dir/acme-site" worktree add -q -b "$branch" "$wt" trunk >/dev/null 2>&1 || return 1
-  cp "$SCRIPT" "$wt/setup-worktree.sh" || return 1
+  install_engine "$wt/setup-worktree.sh" || return 1
   [ "$githooks" = "1" ] && mkdir -p "$wt/scripts/githooks"
   [ "$plain" = "1" ] && rm -f "$wt/composer.json"
+  write_orch "$dir" "${CASE_DOTENV-}"
   printf "%s\n" "$name" > "$dir/CASE"
 
   DDEV_LOG_FILE="$dir/ddev.log"; : > "$DDEV_LOG_FILE"
@@ -318,18 +343,18 @@ $(cat "$OUT")"
 # ===========================================================================
 # --- N. BASE_BRANCH resolution ---------------------------------------------
 #
-# The main checkout's .env is the project's declared base branch and the single
+# The main checkout's .orch is the project's declared base branch and the single
 # source the create-worktree skill reads. The script must agree with the skill,
 # or a worktree cut from a linked worktree inherits that worktree's ticket
 # branch instead of the base -- which is what used to happen.
 #
-# Precedence: explicit BASE_BRANCH in the environment, then .env. No other
+# Precedence: explicit BASE_BRANCH in the environment, then .orch. No other
 # fallback -- in particular NOT the branch checked out where the script runs
 # (review round 1, must-fix 4): a caller often runs this from inside a linked
 # worktree already sitting on its own ticket branch, and silently cutting a
 # new worktree from whatever that happens to be is never what was meant.
-# run_case always passes BASE_BRANCH=trunk, so the .env cases blank it; an
-# explicitly empty value defers to .env.
+# run_case always passes BASE_BRANCH=trunk, so the .orch cases blank it; an
+# explicitly empty value defers to .orch.
 
 cut_from() { sed -n 's/^setup-worktree: cutting [^ ]* from \(.*\)\.$/\1/p' "$OUT" | head -1; }
 
@@ -343,24 +368,24 @@ check_base() { # check_base <name> <expected-branch>
 }
 
 CASE_DOTENV='BASE_BRANCH=from-dotenv' run_case "N1" BASE_BRANCH= -- j1
-check_base "N1: .env supplies BASE_BRANCH when the environment does not" "from-dotenv"
+check_base "N1: .orch supplies BASE_BRANCH when the environment does not" "from-dotenv"
 
 CASE_DOTENV='BASE_BRANCH=from-dotenv' run_case "N2" BASE_BRANCH=from-env -- j2
-check_base "N2: an explicit BASE_BRANCH beats .env" "from-env"
+check_base "N2: an explicit BASE_BRANCH beats .orch" "from-env"
 
 CASE_DOTENV="BASE_BRANCH='quoted-branch'" run_case "N3" BASE_BRANCH= -- j3
-check_base "N3: quotes around the .env value are stripped" "quoted-branch"
+check_base "N3: quotes around the .orch value are stripped" "quoted-branch"
 
 CASE_DOTENV='FOO=bar
 BASE_BRANCH=real-branch
 BAZ=qux' run_case "N4" BASE_BRANCH= -- j4
-check_base "N4: other .env keys are ignored" "real-branch"
+check_base "N4: other .orch keys are ignored" "real-branch"
 
 # No fallback left once BASE_BRANCH is unresolvable in the environment or
-# .env, even though the sandbox's main repo IS a normal (non-detached)
+# .orch, even though the sandbox's main repo IS a normal (non-detached)
 # checkout on "trunk" here -- that checked-out branch must NOT be consulted
 # any more (must-fix 4). AC5 separately pins the detached-HEAD case; these
-# two pin the more common "no .env at all" / "empty .env value" cases,
+# two pin the more common "no .orch at all" / "empty .orch value" cases,
 # which used to silently succeed via the now-removed fallback.
 check_refuses() { # check_refuses <name> <case-dir>
   if [ "$RC" -ne 0 ]; then
@@ -381,22 +406,22 @@ check_refuses "N5" "$CASE_DIR"
 CASE_DOTENV='BASE_BRANCH=' run_case "N6" BASE_BRANCH= -- j6
 check_refuses "N6" "$CASE_DIR"
 
-# The .env is read, never sourced: sourcing it would also import DB_DUMP and
+# The .orch is read, never sourced: sourcing it would also import DB_DUMP and
 # friends, and under `set -euo pipefail` an unrelated line could abort the run.
 CASE_DOTENV='BASE_BRANCH=safe-branch
 DB_DUMP=/nope/should-not-be-inherited.sql.gz' run_case "N7" BASE_BRANCH= -- j7
-check_base "N7: .env is parsed, not sourced (BASE_BRANCH still resolves)" "safe-branch"
+check_base "N7: .orch is parsed, not sourced (BASE_BRANCH still resolves)" "safe-branch"
 if grep -q 'should-not-be-inherited' "$OUT" "$ERR" 2>/dev/null; then
-  fail "N8: .env must not be sourced" "DB_DUMP from .env leaked into the run."
+  fail "N8: .orch must not be sourced" "DB_DUMP from .orch leaked into the run."
 else
-  pass "N8: other .env settings are not inherited"
+  pass "N8: other .orch settings are not inherited"
 fi
 
 CASE_DOTENV='BASE_BRANCH=announced' run_case "N9" BASE_BRANCH= -- j9
 if grep -q 'BASE_BRANCH=announced from' "$OUT"; then
-  pass "N9: the run says when BASE_BRANCH came from .env"
+  pass "N9: the run says when BASE_BRANCH came from .orch"
 else
-  fail "N9: reading .env must be announced" "stdout: $(cat "$OUT")"
+  fail "N9: reading .orch must be announced" "stdout: $(cat "$OUT")"
 fi
 
 # A base branch that exists only on origin (no local branch yet). Given
@@ -414,7 +439,7 @@ if git init -q -b trunk "$n10_dir/origin" >/dev/null 2>&1 &&
   git -C "$n10_dir/origin" -c user.email=t@t -c user.name=t \
     commit -q --allow-empty -m trunk-only >/dev/null 2>&1 &&
   git clone -q "$n10_dir/origin" "$n10_dir/acme-site" >/dev/null 2>&1; then
-  cp "$SCRIPT" "$n10_dir/acme-site/setup-worktree.sh"
+  install_engine "$n10_dir/acme-site/setup-worktree.sh"
   (
     cd "$n10_dir/acme-site" || exit 99
     env "${SCRUB[@]}" PATH="$STUB_BIN:$PATH" WORKTREE_ROOT="$n10_dir/worktrees" \
@@ -604,7 +629,7 @@ build_provision_with_dump() { # build_provision_with_dump <name> <branch> <show-
 
   local wt="$dir/wt"
   git -C "$dir/acme-site" worktree add -q -b "$2" "$wt" trunk >/dev/null 2>&1 || return 1
-  cp "$SCRIPT" "$wt/setup-worktree.sh" || return 1
+  install_engine "$wt/setup-worktree.sh" || return 1
 
   DDEV_LOG_FILE="$dir/ddev.log"; : > "$DDEV_LOG_FILE"
   OUT="$dir/stdout"; ERR="$dir/stderr"
@@ -620,7 +645,7 @@ build_provision_with_dump() { # build_provision_with_dump <name> <branch> <show-
         DDEV_LOG="$DDEV_LOG_FILE" \
         DDEV_SHOW_TABLES="$3" \
         DDEV_MYSQL_EXIT="${4:-}" \
-        DB_DUMP="db/trunk.sql.gz" \
+        DB_DUMP="acme-site/db/trunk.sql.gz" \
         bash ./setup-worktree.sh --provision
   ) > "$OUT" 2> "$ERR"
   RC=$?
@@ -673,7 +698,7 @@ build_provision_with_existing_ddev_name() { # <case-name> <branch> <existing-nam
 
   local wt="$dir/wt"
   git -C "$dir/acme-site" worktree add -q -b "$2" "$wt" trunk >/dev/null 2>&1 || return 1
-  cp "$SCRIPT" "$wt/setup-worktree.sh" || return 1
+  install_engine "$wt/setup-worktree.sh" || return 1
 
   if [ -n "$3" ]; then
     mkdir -p "$wt/.ddev"
@@ -852,13 +877,9 @@ CASES
 # --- Q4: both modes agree for the SAME worktree. NOT itself the
 #     0386-acme-site regression guard -- both calls below go through this
 #     one file's ddev_project_name, so they can never disagree with each
-#     other. retire-worktree.test.sh's R23/R24 pin scripts/retire-worktree.sh's
-#     OWN copy of the rule (independently, against its own script), but that
-#     is not a cross-script guard either: mutating one script's copy of
-#     ddev_project_name leaves the other script's suite green. The
-#     cross-script guard is tests/repo/worktree-naming-parity.test.sh, which
-#     runs both copies over one shared input list (#394). This section
-#     instead pins
+#     other. Both engines now share one ddev_project_name in
+#     scripts/orch-project.sh, so there is no cross-script copy to drift.
+#     This section pins
 #     that this file's two entry points (mode 1's <id> and mode 2's
 #     checked-out branch) feed the SAME shared function, so a future change
 #     that reads the derivation input differently in one mode than the other
@@ -928,7 +949,7 @@ build_provision_detached() { # <case-name> <worktree-dir-basename>
 
   local wt="$dir/$2"
   git -C "$dir/acme-site" worktree add -q --detach "$wt" "$sha" >/dev/null 2>&1 || return 1
-  cp "$SCRIPT" "$wt/setup-worktree.sh" || return 1
+  install_engine "$wt/setup-worktree.sh" || return 1
 
   DDEV_LOG_FILE="$dir/ddev.log"; : > "$DDEV_LOG_FILE"
   OUT="$dir/stdout"; ERR="$dir/stderr"
@@ -1030,7 +1051,7 @@ build_full_with_dump() { # build_full_with_dump <name> <id> <show-tables-value> 
   git -C "$dir/acme-site" add README.md composer.json >/dev/null 2>&1 || return 1
   git -C "$dir/acme-site" -c user.email=t@t -c user.name=t commit -q -m init >/dev/null 2>&1 || return 1
   printf 'not a real dump, just needs to exist\n' > "$dir/acme-site/db/trunk.sql.gz"
-  cp "$SCRIPT" "$dir/acme-site/setup-worktree.sh" || return 1
+  install_engine "$dir/acme-site/setup-worktree.sh" || return 1
 
   DDEV_LOG_FILE="$dir/ddev.log"; : > "$DDEV_LOG_FILE"
   OUT="$dir/stdout"; ERR="$dir/stderr"
@@ -1044,7 +1065,7 @@ build_full_with_dump() { # build_full_with_dump <name> <id> <show-tables-value> 
         DDEV_SHOW_TABLES="$3" \
         DDEV_MYSQL_EXIT="${4:-}" \
         WORKTREE_ROOT="$dir/worktrees" \
-        DB_DUMP="db/trunk.sql.gz" \
+        DB_DUMP="acme-site/db/trunk.sql.gz" \
         BASE_BRANCH=trunk \
         bash ./setup-worktree.sh "$2"
   ) > "$OUT" 2> "$ERR"
@@ -1134,7 +1155,7 @@ fi
 
 # ===========================================================================
 # AB. Provision hook resolution (worktree-promotion-spec.md):
-#     PROVISION_HOOK env, then PROVISION_HOOK in the main checkout's .env,
+#     PROVISION_HOOK env, then PROVISION_HOOK in .orch,
 #     then the conventional <worktree>/scripts/setup-worktree.sh, then the
 #     engine's OWN --provision mode when none of those exists on disk.
 #     Recursion guard: the engine's own --provision mode must NEVER call the
@@ -1173,7 +1194,7 @@ else
   fail "AB1: could not build the sandbox case" "git init failed"
 fi
 
-# --- AB2: PROVISION_HOOK in the main checkout's .env, when not set in the
+# --- AB2: PROVISION_HOOK in .orch, when not set in the
 #     environment. ------------------------------------------------------------
 hook_dir2="$SANDBOX/case$((CASE_N + 1))"
 mkdir -p "$hook_dir2"
@@ -1188,9 +1209,9 @@ CASE_DOTENV="PROVISION_HOOK=$hook_dir2/hook.sh"
 if run_case ab2-provision-hook-dotenv DDEV_SHOW_TABLES="" \
      "HOOK_LOG_TARGET=$HOOK_LOG_AB2" -- ab2; then
   if grep -qF "ran:$CASE_DIR/worktrees/ab2:--provision" "$HOOK_LOG_AB2" 2>/dev/null; then
-    pass "AB2: PROVISION_HOOK from the main checkout's .env is used when unset in the environment"
+    pass "AB2: PROVISION_HOOK from .orch is used when unset in the environment"
   else
-    fail "AB2: PROVISION_HOOK from .env must be resolved and invoked" "$(cat "$HOOK_LOG_AB2" 2>/dev/null)"
+    fail "AB2: PROVISION_HOOK from .orch must be resolved and invoked" "$(cat "$HOOK_LOG_AB2" 2>/dev/null)"
   fi
 else
   fail "AB2: could not build the sandbox case" "git init failed"
@@ -1198,7 +1219,7 @@ fi
 unset CASE_DOTENV
 
 # --- AB3: the conventional <worktree>/scripts/setup-worktree.sh, committed
-#     into the branch content itself, when neither env nor .env set
+#     into the branch content itself, when neither env nor .orch set
 #     PROVISION_HOOK. -------------------------------------------------------
 ab3_dir="$SANDBOX/ab3"
 mkdir -p "$ab3_dir/repo/scripts"
@@ -1211,7 +1232,7 @@ HOOK
 chmod +x "$ab3_dir/repo/scripts/setup-worktree.sh"
 git -C "$ab3_dir/repo" add README.md scripts/setup-worktree.sh >/dev/null 2>&1
 git -C "$ab3_dir/repo" -c user.email=t@t -c user.name=t commit -q -m init >/dev/null 2>&1
-cp "$SCRIPT" "$ab3_dir/repo/setup-worktree-engine.sh"
+install_engine "$ab3_dir/repo/setup-worktree-engine.sh"
 AB3_HOOK_LOG="$ab3_dir/hook.log"; : > "$AB3_HOOK_LOG"
 (
   cd "$ab3_dir/repo" || exit 99
@@ -1226,7 +1247,7 @@ AB3_HOOK_LOG="$ab3_dir/hook.log"; : > "$AB3_HOOK_LOG"
 ) > "$ab3_dir/stdout" 2> "$ab3_dir/stderr"
 
 if grep -qF "ran:$ab3_dir/worktrees/ab3:--provision" "$AB3_HOOK_LOG" 2>/dev/null; then
-  pass "AB3: the conventional <worktree>/scripts/setup-worktree.sh runs when no env/.env PROVISION_HOOK is set"
+  pass "AB3: the conventional <worktree>/scripts/setup-worktree.sh runs when no env/.orch PROVISION_HOOK is set"
 else
   fail "AB3: the conventional hook path must be tried before falling back to the engine's own provisioning" \
 "$(cat "$AB3_HOOK_LOG" 2>/dev/null)
@@ -1238,7 +1259,7 @@ fi
 #     explicitly here so this requirement has its own named case. -----------
 if run_case ab4-no-hook-anywhere DDEV_SHOW_TABLES="" -- ab4; then
   if grep -qE '^start' "$DDEV_LOG_FILE" 2>/dev/null; then
-    pass "AB4: with no PROVISION_HOOK/.env/conventional hook, the engine provisions directly"
+    pass "AB4: with no PROVISION_HOOK/.orch/conventional hook, the engine provisions directly"
   else
     fail "AB4: the engine must run its own --provision logic when no hook exists on disk" "$(tr '\037' '|' < "$DDEV_LOG_FILE")"
   fi
@@ -1249,7 +1270,7 @@ fi
 # --- AB4b: a PROVISION_HOOK set in the environment but pointing at a path
 #     that doesn't exist falls through to the engine's own provisioning,
 #     rather than hard-failing trying to exec a missing file (review round
-#     1: resolve_provision_hook used to trust env/.env with no on-disk
+#     1: resolve_provision_hook used to trust env/.orch with no on-disk
 #     check). ------------------------------------------------------------
 if run_case ab4b-stale-provision-hook DDEV_SHOW_TABLES="" \
     PROVISION_HOOK="$SANDBOX/does-not-exist-anywhere.sh" -- ab4b; then
@@ -1296,38 +1317,52 @@ fi
 #     provisions successfully.
 # ===========================================================================
 
-# --- AC1: WORKTREE_ROOT default is $HOME/Projects/worktrees/<main-checkout
-#     basename>, not a hardcoded .../acme-site. Uses a fake $HOME so this
-#     never touches the real one. -------------------------------------------
+# --- AC1: WORKTREE_ROOT defaults to <project root>/code, and the main
+#     checkout's DDEV project is named <PROJECT_NAME> once, never renamed. --
 ac1_dir="$SANDBOX/ac1"
-mkdir -p "$ac1_dir/some-other-checkout" "$ac1_dir/fake-home"
-git init -q -b trunk "$ac1_dir/some-other-checkout" >/dev/null 2>&1
-printf 'seed\n' > "$ac1_dir/some-other-checkout/README.md"
-git -C "$ac1_dir/some-other-checkout" add README.md >/dev/null 2>&1
-git -C "$ac1_dir/some-other-checkout" -c user.email=t@t -c user.name=t commit -q -m init >/dev/null 2>&1
-cp "$SCRIPT" "$ac1_dir/some-other-checkout/setup-worktree.sh"
-(
-  cd "$ac1_dir/some-other-checkout" || exit 99
-  env "${SCRUB[@]}" \
-      PATH="$STUB_BIN:$PATH" \
-      HOME="$ac1_dir/fake-home" \
-      DB_DUMP="$ac1_dir/no-such-dump.sql.gz" \
-      BASE_BRANCH=trunk \
-      DDEV_SHOW_TABLES="" \
-      bash ./setup-worktree.sh ac1
-) > "$ac1_dir/stdout" 2> "$ac1_dir/stderr"
-
-if [ -d "$ac1_dir/fake-home/Projects/worktrees/some-other-checkout/ac1" ]; then
-  pass "AC1: WORKTREE_ROOT default is \$HOME/Projects/worktrees/<main-checkout-basename>, not a hardcoded acme-site path"
+mkdir -p "$ac1_dir/code/some-other-checkout/.ddev"
+git init -q -b trunk "$ac1_dir/code/some-other-checkout" >/dev/null 2>&1
+printf 'seed\n' > "$ac1_dir/code/some-other-checkout/README.md"
+git -C "$ac1_dir/code/some-other-checkout" add README.md >/dev/null 2>&1
+git -C "$ac1_dir/code/some-other-checkout" -c user.email=t@t -c user.name=t commit -q -m init >/dev/null 2>&1
+printf 'BASE_BRANCH=trunk\n' > "$ac1_dir/.orch"
+cp "$SCRIPT" "$ac1_dir/setup-worktree.sh"
+ac1_run() { # ac1_run <id>
+  (
+    cd "$ac1_dir" || exit 99
+    env "${SCRUB[@]}" \
+        PATH="$STUB_BIN:$PATH" \
+        DB_DUMP="$ac1_dir/no-such-dump.sql.gz" \
+        DDEV_SHOW_TABLES="" \
+        bash ./setup-worktree.sh "$1"
+  ) > "$ac1_dir/stdout" 2> "$ac1_dir/stderr"
+}
+ac1_run ac1
+if [ -d "$ac1_dir/code/ac1" ]; then
+  pass "AC1: WORKTREE_ROOT defaults to <project root>/code, run from the project root"
 else
-  fail "AC1: WORKTREE_ROOT must default to \$HOME/Projects/worktrees/<main-checkout-basename>" \
-"expected a worktree under $ac1_dir/fake-home/Projects/worktrees/some-other-checkout/ac1
+  fail "AC1: WORKTREE_ROOT must default to <project root>/code" \
+"expected a worktree at $ac1_dir/code/ac1
 stdout: $(cat "$ac1_dir/stdout" 2>/dev/null)
 stderr: $(cat "$ac1_dir/stderr" 2>/dev/null)"
 fi
+ac1_name="$(cat "$ac1_dir/code/some-other-checkout/.ddev/config.local.yaml" 2>/dev/null)"
+if [ "$ac1_name" = "name: ac1" ]; then
+  pass "AC1b: the main checkout's DDEV project is named after the project root"
+else
+  fail "AC1b: the main checkout's config.local.yaml must be 'name: ac1'" "got: $ac1_name"
+fi
+printf 'name: kept\n' > "$ac1_dir/code/some-other-checkout/.ddev/config.local.yaml"
+ac1_run ac1-second
+if [ "$(cat "$ac1_dir/code/some-other-checkout/.ddev/config.local.yaml")" = "name: kept" ] &&
+  grep -q "WARNING: the main checkout's DDEV project is named 'kept'" "$ac1_dir/stderr"; then
+  pass "AC1c: an existing main checkout DDEV name is kept, with a warning"
+else
+  fail "AC1c: an existing main checkout DDEV name must be kept, with a warning" "stderr: $(cat "$ac1_dir/stderr")"
+fi
 
 # --- AC2: DB_DUMP precedence -- environment wins, then the main checkout's
-#     .env, then no default at all (no db/trunk.sql.gz literal in the engine).
+#     .orch, then no default at all (no db/trunk.sql.gz literal in the engine).
 #     No dump resolved anywhere -> skip the import, exit 0. ------------------
 if run_case ac2-db-dump-env-wins DB_DUMP="does-not-exist-either.sql.gz" -- ac2; then
   expect_rc0 "AC2a: an unresolvable DB_DUMP still exits 0 (skips the import)"
@@ -1341,9 +1376,9 @@ CASE_UNSET_DB_DUMP=1
 if run_case ac3-db-dump-dotenv -- ac3; then
   unset CASE_UNSET_DB_DUMP
   if grep -qiF 'from-dotenv.sql.gz' "$OUT" "$ERR" 2>/dev/null; then
-    pass "AC3: DB_DUMP from the main checkout's .env is used when unset in the environment"
+    pass "AC3: DB_DUMP from .orch is used when unset in the environment"
   else
-    fail "AC3: DB_DUMP must be resolvable from the main checkout's .env" \
+    fail "AC3: DB_DUMP must be resolvable from .orch" \
 "stdout: $(cat "$OUT")
 stderr: $(cat "$ERR")"
   fi
@@ -1375,7 +1410,7 @@ else
 fi
 
 
-# --- AC5: BASE_BRANCH unresolvable anywhere (no env, no .env, no
+# --- AC5: BASE_BRANCH unresolvable anywhere (no env, no .orch, no
 #     hardcoded base-branch literal left in the engine) -> refuse, exit
 #     non-zero, create NOTHING (not even the worktree directory). ----------
 ac5_dir="$SANDBOX/ac5"
@@ -1389,7 +1424,7 @@ printf 'seed\n' > "$ac5_dir/acme-site/README.md"
 git -C "$ac5_dir/acme-site" add README.md >/dev/null 2>&1
 git -C "$ac5_dir/acme-site" -c user.email=t@t -c user.name=t commit -q -m init >/dev/null 2>&1
 git -C "$ac5_dir/acme-site" checkout -q --detach >/dev/null 2>&1
-cp "$SCRIPT" "$ac5_dir/acme-site/setup-worktree.sh"
+install_engine "$ac5_dir/acme-site/setup-worktree.sh"
 (
   cd "$ac5_dir/acme-site" || exit 99
   env "${SCRUB[@]}" \
@@ -1419,7 +1454,7 @@ git init -q -b trunk "$ac6_dir/acme-site" >/dev/null 2>&1
 printf 'seed\n' > "$ac6_dir/acme-site/README.md"
 git -C "$ac6_dir/acme-site" add README.md >/dev/null 2>&1
 git -C "$ac6_dir/acme-site" -c user.email=t@t -c user.name=t commit -q -m init >/dev/null 2>&1
-cp "$SCRIPT" "$ac6_dir/acme-site/setup-worktree.sh"
+install_engine "$ac6_dir/acme-site/setup-worktree.sh"
 AC6_DDEV_LOG="$ac6_dir/ddev.log"; : > "$AC6_DDEV_LOG"
 (
   cd "$ac6_dir/acme-site" || exit 99
@@ -1464,7 +1499,7 @@ git init -q -b trunk "$ac7_dir/acme-site" >/dev/null 2>&1
 printf 'seed\n' > "$ac7_dir/acme-site/README.md"
 git -C "$ac7_dir/acme-site" add README.md >/dev/null 2>&1
 git -C "$ac7_dir/acme-site" -c user.email=t@t -c user.name=t commit -q -m init >/dev/null 2>&1
-cp "$SCRIPT" "$ac7_dir/acme-site/setup-worktree.sh"
+install_engine "$ac7_dir/acme-site/setup-worktree.sh"
 (
   cd "$ac7_dir/acme-site" || exit 99
   env "${SCRUB[@]}" \
@@ -1499,7 +1534,7 @@ printf 'seed\n' > "$ac8_dir/acme-site/README.md"
 printf 'name: seed\n' > "$ac8_dir/acme-site/.ddev/config.yaml"
 git -C "$ac8_dir/acme-site" add README.md .ddev/config.yaml >/dev/null 2>&1
 git -C "$ac8_dir/acme-site" -c user.email=t@t -c user.name=t commit -q -m init >/dev/null 2>&1
-cp "$SCRIPT" "$ac8_dir/acme-site/setup-worktree.sh"
+install_engine "$ac8_dir/acme-site/setup-worktree.sh"
 AC8_DDEV_LOG="$ac8_dir/ddev.log"; : > "$AC8_DDEV_LOG"
 (
   cd "$ac8_dir/acme-site" || exit 99
@@ -1538,7 +1573,7 @@ git init -q -b trunk "$ac9_dir/acme-site" >/dev/null 2>&1
 printf 'seed\n' > "$ac9_dir/acme-site/README.md"
 git -C "$ac9_dir/acme-site" add README.md >/dev/null 2>&1
 git -C "$ac9_dir/acme-site" -c user.email=t@t -c user.name=t commit -q -m init >/dev/null 2>&1
-cp "$SCRIPT" "$ac9_dir/acme-site/setup-worktree.sh"
+install_engine "$ac9_dir/acme-site/setup-worktree.sh"
 (
   cd "$ac9_dir/acme-site" || exit 99
   env "${SCRUB[@]}" \
@@ -1629,12 +1664,12 @@ build_y_case() {
   OUT="$dir/stdout"; ERR="$dir/stderr"
 
   local dbdump_env=(DB_DUMP="$dir/no-such-dump.sql.gz")
-  [ "$dump" = "yes" ] && dbdump_env=(DB_DUMP="db/trunk.sql.gz")
+  [ "$dump" = "yes" ] && dbdump_env=(DB_DUMP="acme-site/db/trunk.sql.gz")
 
   if [ "$mode" = "provision" ]; then
     local wt="$dir/wt"
     git -C "$dir/acme-site" worktree add -q -b "$idbr" "$wt" trunk >/dev/null 2>&1 || return 1
-    cp "$SCRIPT" "$wt/setup-worktree.sh" || return 1
+    install_engine "$wt/setup-worktree.sh" || return 1
     PROV_WT="$wt"; PROV_MAIN="$dir/acme-site"
     (
       cd "$wt" || exit 99
@@ -1647,7 +1682,7 @@ build_y_case() {
           bash ./setup-worktree.sh --provision
     ) > "$OUT" 2> "$ERR"
   else
-    cp "$SCRIPT" "$dir/acme-site/setup-worktree.sh" || return 1
+    install_engine "$dir/acme-site/setup-worktree.sh" || return 1
     FULL_WT="$dir/worktrees/$idbr"
     (
       cd "$dir/acme-site" || exit 99
@@ -1869,7 +1904,7 @@ if git init -q -b trunk "$y19_dir/acme-site" >/dev/null 2>&1; then
   git -C "$y19_dir/acme-site" add -A >/dev/null 2>&1
   git -C "$y19_dir/acme-site" -c user.email=t@t -c user.name=t \
     commit -q -m init >/dev/null 2>&1
-  cp "$SCRIPT" "$y19_dir/acme-site/setup-worktree.sh"
+  install_engine "$y19_dir/acme-site/setup-worktree.sh"
 
   Y19_LOG="$y19_dir/ddev.log"; : > "$Y19_LOG"
   Y19_OUT="$y19_dir/stdout"
@@ -1881,7 +1916,7 @@ if git init -q -b trunk "$y19_dir/acme-site" >/dev/null 2>&1; then
         DDEV_LOG="$Y19_LOG" \
         DDEV_SHOW_TABLES="" \
         WORKTREE_ROOT="relative-worktrees" \
-        DB_DUMP="db/trunk.sql.gz" \
+        DB_DUMP="acme-site/db/trunk.sql.gz" \
         BASE_BRANCH=trunk \
         bash ./setup-worktree.sh wt-y19
   ) > "$Y19_OUT" 2>&1
@@ -1929,7 +1964,7 @@ if git init -q --bare -b trunk "$r1_dir/origin.git" >/dev/null 2>&1 &&
     git branch -q -D feature-x
   ) >/dev/null 2>&1
   r1_remote_sha="$(git -C "$r1_dir/acme-site" rev-parse origin/feature-x)"
-  cp "$SCRIPT" "$r1_dir/acme-site/setup-worktree.sh"
+  install_engine "$r1_dir/acme-site/setup-worktree.sh"
   (
     cd "$r1_dir/acme-site" || exit 99
     env "${SCRUB[@]}" PATH="$STUB_BIN:$PATH" \

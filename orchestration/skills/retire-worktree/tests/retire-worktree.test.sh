@@ -72,6 +72,12 @@ trap 'chmod -R u+rwx "$SANDBOX_BASE" 2>/dev/null; rm -rf "$SANDBOX_BASE"' EXIT
 
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 
+# Each fixture root is a project root under ORCH_PROJECTS_DIR. The engine runs
+# from a copy, so point it at the real resolver.
+export ORCH_PROJECTS_DIR="$SANDBOX_BASE"
+export ORCH_PROJECT_LIB="$(cd "$SKILL_DIR/../.." && pwd -P)/scripts/orch-project.sh"
+unset PROJECT_NAME MAIN_CHECKOUT RETIRE_HOOK BASE_BRANCH
+
 PASS=0
 FAIL=0
 SKIP=0
@@ -184,6 +190,7 @@ new_fixture() {
   WTROOT="$root/worktrees"
   mkdir -p "$WTROOT"
   git init -q "$MAIN"
+  printf 'PROJECT_NAME=acme-site\nMAIN_CHECKOUT=acme-site\n' > "$root/.orch"
   # Matches the real repo's .gitignore (.ddev/config.local.yaml is ignored
   # there — see .gitignore's "DDEV per-worktree project name" entry), so the
   # fixture's dirty check reflects the same reality a real worktree would:
@@ -1095,10 +1102,7 @@ real_ddev_project_name() { # real_ddev_project_name <locale> <input> -> name
   # in this suite runs against a main checkout literally named
   # "acme-site" (see new_fixture), so that is the value a real call site
   # would resolve here too.
-  LC_ALL="$1" bash -c "
-$(sed -n '/^ddev_project_name() {/,/^}/p' "$SCRIPT_COPY")
-ddev_project_name \"\$1\" acme-site
-" _ "$2"
+  LC_ALL="$1" bash -c '. "$ORCH_PROJECT_LIB"; ddev_project_name "$1" acme-site' _ "$2"
 }
 
 got="$(real_ddev_project_name en_US.UTF-8 'café-382')"
@@ -1211,30 +1215,43 @@ else
   fail "RD3: a project with no retire hook must still retire normally" "exit $CODE; stdout: $OUT; stderr: $ERR"
 fi
 
-# --- RD4: WORKTREE_ROOT default is $HOME/Projects/worktrees/<main-checkout
-#     basename>, not a hardcoded .../acme-site. Uses a fake $HOME. -------
+# --- RD4: default layout (<root>/code/<main> + <root>/code/<id>), run from
+#     inside the worktree being retired. Retire must step out of it first.
 rd4_root="$SANDBOX_BASE/rd4"
-mkdir -p "$rd4_root/some-other-checkout" "$rd4_root/fake-home"
-git init -q "$rd4_root/some-other-checkout" >/dev/null 2>&1
-(cd "$rd4_root/some-other-checkout" && git checkout -q -b trunk && echo seed > seed.txt && git add seed.txt && git commit -q -m seed) >/dev/null 2>&1
-mkdir -p "$rd4_root/fake-home/Projects/worktrees/some-other-checkout"
-git -C "$rd4_root/some-other-checkout" worktree add -q -b rd4 \
-  "$rd4_root/fake-home/Projects/worktrees/some-other-checkout/rd4" trunk >/dev/null 2>&1
+mkdir -p "$rd4_root/code/some-other-checkout"
+git init -q "$rd4_root/code/some-other-checkout" >/dev/null 2>&1
+(cd "$rd4_root/code/some-other-checkout" && git checkout -q -b trunk && echo seed > seed.txt && git add seed.txt && git commit -q -m seed) >/dev/null 2>&1
+git -C "$rd4_root/code/some-other-checkout" worktree add -q -b rd4 "$rd4_root/code/rd4" trunk >/dev/null 2>&1
+: > "$rd4_root/.orch"
 (
-  cd "$rd4_root/some-other-checkout" || exit 99
-  env -u WORKTREE_ROOT PATH="$MINIMAL_PATH" HOME="$rd4_root/fake-home" \
-      bash "$SCRIPT_COPY" rd4
+  cd "$rd4_root/code/rd4" || exit 99
+  PATH="$MINIMAL_PATH" bash "$SCRIPT_COPY" rd4
 ) > "$rd4_root/stdout" 2> "$rd4_root/stderr"
 rd4_rc=$?
 
-if [ "$rd4_rc" -eq 0 ] && [ ! -e "$rd4_root/fake-home/Projects/worktrees/some-other-checkout/rd4" ]; then
-  pass "RD4: WORKTREE_ROOT defaults to \$HOME/Projects/worktrees/<main-checkout-basename>, not a hardcoded acme-site path"
+if [ "$rd4_rc" -eq 0 ] && [ ! -e "$rd4_root/code/rd4" ] && [ -d "$rd4_root/code/some-other-checkout" ]; then
+  pass "RD4: retire works from inside the worktree it retires, in the default layout"
 else
-  fail "RD4: WORKTREE_ROOT must default to \$HOME/Projects/worktrees/<main-checkout-basename>" \
+  fail "RD4: retire must work from inside the worktree it retires" \
 "exit $rd4_rc
 stdout: $(cat "$rd4_root/stdout")
 stderr: $(cat "$rd4_root/stderr")"
 fi
+
+# --- RD4b: a worktree whose DDEV name is the main checkout's (<PROJECT_NAME>)
+#     must never have that project deleted.
+new_fixture
+add_worktree rd4b
+add_ddev_dir rd4b acme-site
+export DDEV_LOG="$SANDBOX_BASE/rd4b-ddev.log"; : > "$DDEV_LOG"
+run_retire "$MAIN" "$WTROOT" full rd4b
+if [ ! -s "$DDEV_LOG" ] && printf '%s' "$ERR" | grep -q "main checkout's DDEV project; refusing"; then
+  pass "RD4b: the main checkout's DDEV project is never deleted"
+else
+  fail "RD4b: retire must refuse to delete the DDEV project named <PROJECT_NAME>" "ddev log: $(cat "$DDEV_LOG")
+stderr: $ERR"
+fi
+unset DDEV_LOG
 
 # ===========================================================================
 # RD5-RD7: BUG regression -- the conventional <worktree>/scripts/retire-worktree.sh

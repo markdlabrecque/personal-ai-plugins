@@ -4,8 +4,8 @@ set -uo pipefail
 # Generic worktree-teardown engine (worktree-promotion-spec.md). This is the
 # GLOBAL, project-agnostic half of a base/override pair -- see this skill's
 # SKILL.md and create-worktree/SKILL.md for the two-layer model. A project
-# with no shim at all still works: WORKTREE_ROOT defaults to the main
-# checkout's own basename, and RETIRE_HOOK is entirely optional.
+# with no shim at all still works: project config comes from the shared
+# resolver (scripts/orch-project.sh), and RETIRE_HOOK is entirely optional.
 #
 # Retire a finished worktree: close its Herdr workspace, delete its DDEV
 # project (or hand that to a project's RETIRE_HOOK, if one resolves), remove
@@ -17,8 +17,9 @@ set -uo pipefail
 #
 # Usage: retire-worktree.sh <id> [--force] [--ddev-only]
 #
-# <id> is the worktree directory name. Run it from anywhere inside the main
-# checkout. Flags may appear in any order after <id>.
+# <id> is the worktree directory name. Run it from anywhere inside the
+# project root, including the worktree being retired. Flags may appear in
+# any order after <id>.
 #
 # --force skips the uncommitted-work check (step 2) and lets git discard it
 # anyway.
@@ -39,8 +40,8 @@ set -uo pipefail
 # branch_has_landed.
 #
 # The optional project retire hook (PROVISION_HOOK's counterpart on the
-# teardown side): RETIRE_HOOK in the environment, then RETIRE_HOOK in the
-# main checkout's .env, then the conventional
+# teardown side): RETIRE_HOOK in the environment, then RETIRE_HOOK in
+# <project root>/.orch, then the conventional
 # <worktree>/scripts/retire-worktree.sh. When one resolves, it runs with cwd
 # set to the still-existing worktree, BEFORE the worktree is removed, and
 # REPLACES this engine's own DDEV-delete step (step 4) only. The Herdr
@@ -102,58 +103,14 @@ if ! [[ "$id" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
   exit 1
 fi
 
-# --- Shared DDEV project name rule (ticket #393, generalized by the
-#     worktree-promotion-spec) -- see setup-worktree.sh's copy of this
-#     function for the full rule commentary. Must stay byte-identical to
-#     that copy; see tests/worktree-naming-parity.test.sh. ------------------
-ddev_project_name() {
-  local raw="$1" main_basename="$2"
+ORCH_PROJECT_LIB="${ORCH_PROJECT_LIB:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd -P)/scripts/orch-project.sh}"
+# shellcheck source=../../../scripts/orch-project.sh
+. "$ORCH_PROJECT_LIB"
 
-  _dpn_sanitize() { # <input> -> lowercased, sanitized, hyphen-collapsed
-    local lower
-    lower="$(printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
-    printf '%s' "$lower" | LC_ALL=C sed -E 's/[^a-z0-9-]/-/g; s/-+/-/g; s/^-//; s/-$//'
-  }
-
-  local sanitized first id_part i
-  sanitized="$(_dpn_sanitize "$raw")"
-  local -a segs
-  IFS='-' read -r -a segs <<< "$sanitized"
-  first="${segs[0]:-}"
-  if [[ "$first" =~ ^[0-9]+$ ]]; then
-    id_part="$first"
-  else
-    id_part="${segs[0]:-}"
-    for i in 1 2; do
-      [ -n "${segs[$i]:-}" ] && id_part="$id_part-${segs[$i]}"
-    done
-    [ -z "$id_part" ] && id_part="worktree"
-  fi
-
-  local bsanitized basename_part j
-  bsanitized="$(_dpn_sanitize "$main_basename")"
-  local -a bsegs
-  IFS='-' read -r -a bsegs <<< "$bsanitized"
-  basename_part="${bsegs[0]:-}"
-  for j in 1 2; do
-    [ -n "${bsegs[$j]:-}" ] && basename_part="$basename_part-${bsegs[$j]}"
-  done
-  [ -z "$basename_part" ] && basename_part="worktree"
-
-  printf '%s-%s' "$id_part" "$basename_part"
-}
-
-read_dotenv_var() { # read_dotenv_var <repo> <VAR> -> value or empty
-  local repo="$1" var="$2"
-  [ -f "$repo/.env" ] || return 0
-  sed -n "s/^[[:space:]]*${var}[[:space:]]*=[[:space:]]*//p" "$repo/.env" |
-    tail -n 1 |
-    tr -d '\r' |
-    sed -e "s/^['\"]//" -e "s/['\"]\$//"
-}
-
-main_repo="$(git rev-parse --show-toplevel)"
-main_basename="$(basename "$main_repo")"
+orch_resolve "$PWD" || exit 1
+main_repo="$MAIN_CHECKOUT"
+# Never stand inside the worktree being removed.
+cd "$ORCH_ROOT" || exit 1
 
 # Locate the worktree by asking git: <id> must be the directory name of a
 # linked worktree of THIS repo, wherever it lives on disk. The first entry
@@ -195,13 +152,9 @@ branch="$(git -C "$worktree" symbolic-ref --quiet --short HEAD 2>/dev/null)" || 
 # worktree look dirty and block retirement.
 resolve_retire_hook() { # -> prints path, rc0 if found
   local val
-  if [ -n "${RETIRE_HOOK-}" ]; then
-    printf '%s' "$RETIRE_HOOK"
-    return 0
-  fi
-  val="$(read_dotenv_var "$main_repo" RETIRE_HOOK)"
+  val="$(orch_get "$ORCH_ROOT" RETIRE_HOOK)"
   if [ -n "$val" ]; then
-    printf '%s' "$val"
+    orch_abs "$ORCH_ROOT" "$val"
     return 0
   fi
   if [ -f "$worktree/scripts/retire-worktree.sh" ]; then
@@ -224,7 +177,7 @@ else
 fi
 
 # The conventional hook, when it is the SOURCE of the resolved hook (not an
-# env/.env override pointing outside the worktree), is engine plumbing, not
+# env/.orch override pointing outside the worktree), is engine plumbing, not
 # work-in-progress -- its own untracked/modified status must not block
 # retirement, the same way .ddev/config.local.yaml (gitignored) never does.
 if [ -n "$retire_hook" ] && [ "$retire_hook" = "$worktree/scripts/retire-worktree.sh" ]; then
@@ -297,8 +250,13 @@ run_own_teardown() {
         sed -e "s/^['\"]//" -e "s/['\"]\$//"
     )"
   fi
-  ddev_project="${ddev_project:-$(ddev_project_name "$id" "$main_basename")}"
-  if command -v ddev >/dev/null 2>&1; then
+  ddev_project="${ddev_project:-$(ddev_project_name "$id" "$PROJECT_NAME")}"
+  # The main checkout's DDEV project is named <PROJECT_NAME>. A worktree
+  # carrying that name (copied config, hand edit) must never delete it.
+  if [ "$ddev_project" = "$PROJECT_NAME" ]; then
+    echo "retire-worktree: $worktree is registered as '$ddev_project', the main checkout's DDEV project; refusing to delete it." >&2
+    ddev_project="$ddev_project (kept: main checkout's project)"
+  elif command -v ddev >/dev/null 2>&1; then
     if [ -d "$worktree/.ddev" ]; then
       if ( cd "$worktree" && ddev delete -yO ) >/dev/null 2>&1; then
         echo "retire-worktree: DDEV project $ddev_project deleted."

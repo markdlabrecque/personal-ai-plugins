@@ -25,23 +25,11 @@ set -uo pipefail
 
 # --- Configuration ----------------------------------------------------------
 
-BASE_BRANCH_ENV="${BASE_BRANCH-}"
+# Project config (BASE_BRANCH, WORKTREE_ROOT, MAIN_CHECKOUT) comes from the
+# shared resolver: environment, then <project root>/.orch, then the default.
 REMOTE="${REMOTE:-origin}"
 
-WORKTREE_ROOT_ENV="${WORKTREE_ROOT-}"
-
 # -----------------------------------------------------------------------------
-
-# --- Small .env reader (never sourced -- same shape as the copy in
-#     retire-worktree.sh and create-worktree's setup-worktree.sh). ----------
-read_dotenv_var() { # read_dotenv_var <repo> <VAR> -> value or empty
-  local repo="$1" var="$2"
-  [ -f "$repo/.env" ] || return 0
-  sed -n "s/^[[:space:]]*${var}[[:space:]]*=[[:space:]]*//p" "$repo/.env" |
-    tail -n 1 |
-    tr -d '\r' |
-    sed -e "s/^['\"]//" -e "s/['\"]\$//"
-}
 
 dry_run=0
 for a in "$@"; do
@@ -51,12 +39,15 @@ done
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 retire_script="$script_dir/retire-worktree.sh"
 
-main_repo="$(git rev-parse --show-toplevel)"
-main_basename="$(basename "$main_repo")"
+ORCH_PROJECT_LIB="${ORCH_PROJECT_LIB:-$(cd "$script_dir/../../.." && pwd -P)/scripts/orch-project.sh}"
+# shellcheck source=../../../scripts/orch-project.sh
+. "$ORCH_PROJECT_LIB"
 
-WORKTREE_ROOT="${WORKTREE_ROOT_ENV:-$HOME/Projects/worktrees/$main_basename}"
+orch_resolve "$PWD" || exit 1
+main_repo="$MAIN_CHECKOUT"
+cd "$ORCH_ROOT" || exit 1
 
-# --- Resolve BASE_BRANCH: environment, then the main checkout's .env. No
+# --- Resolve BASE_BRANCH: environment, then .orch. No
 #     other fallback -- this was previously a bare project-specific base
 #     branch literal, the one project-specific default this engine carried
 #     (review round 1, must-fix 1). Worse than the create engine's old
@@ -66,18 +57,12 @@ WORKTREE_ROOT="${WORKTREE_ROOT_ENV:-$HOME/Projects/worktrees/$main_basename}"
 #     its unlanded worktrees reaped against the WRONG base, silently.
 #     Refusing when neither resolves is the same
 #     rule create-worktree/setup-worktree.sh uses for its own BASE_BRANCH. --
-if [ -n "$BASE_BRANCH_ENV" ]; then
-  BASE_BRANCH="$BASE_BRANCH_ENV"
-else
-  base_branch_dotenv="$(read_dotenv_var "$main_repo" BASE_BRANCH)"
-  if [ -n "$base_branch_dotenv" ]; then
-    BASE_BRANCH="$base_branch_dotenv"
-    echo "reap-worktrees: BASE_BRANCH=$BASE_BRANCH from $main_repo/.env."
-  else
-    echo "reap-worktrees: BASE_BRANCH is not set in the environment or in $main_repo/.env; refusing to guess. Set BASE_BRANCH and try again." >&2
-    exit 1
-  fi
+BASE_BRANCH="$(orch_get "$ORCH_ROOT" BASE_BRANCH)"
+if [ -z "$BASE_BRANCH" ]; then
+  echo "reap-worktrees: BASE_BRANCH is not set in the environment or in $ORCH_ROOT/.orch; refusing to guess. Set BASE_BRANCH and try again." >&2
+  exit 1
 fi
+[ -n "$_ORCH_ENV_BASE_BRANCH" ] || echo "reap-worktrees: BASE_BRANCH=$BASE_BRANCH from $ORCH_ROOT/.orch."
 
 # --- Step 1: fetch first, fail loudly --------------------------------------
 if ! git -C "$main_repo" fetch --quiet "$REMOTE" "$BASE_BRANCH"; then
@@ -146,7 +131,12 @@ process_worktree() {
 
   [ -z "$path" ] && return
 
-  if [ "$path" = "$main_repo" ]; then
+  local path_real
+  path_real="$(cd "$path" 2>/dev/null && pwd -P)" || path_real=""
+
+  # The main checkout sits inside WORKTREE_ROOT by default: compare real
+  # paths so a symlink or trailing-slash difference can never reap it.
+  if [ "$path" = "$main_repo" ] || [ "$path_real" = "$main_repo" ]; then
     return
   fi
 
@@ -156,8 +146,6 @@ process_worktree() {
     return
   fi
 
-  local path_real
-  path_real="$(cd "$path" 2>/dev/null && pwd -P)" || path_real=""
   if [ -z "$wtroot_real" ]; then
     echo "reap-worktrees: skipping $path (WORKTREE_ROOT does not exist)."
     any_skipped=1

@@ -121,8 +121,14 @@ orch_find_main_checkout() {
 #   WORKTREE_ROOT   absolute; default <root>/code
 #   MAIN_CHECKOUT   absolute; default the one git checkout in WORKTREE_ROOT
 orch_resolve() {
-  local root raw wt main
-  root="$(orch_project_root "${1:-$PWD}")" || return 1
+  local start="${1:-$PWD}" root raw wt main common
+  # A worktree under a WORKTREE_ROOT outside the project root still finds it
+  # through its main checkout.
+  if ! root="$(orch_project_root "$start" 2>/dev/null)"; then
+    common="$(git -C "$start" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" &&
+      root="$(orch_project_root "$(dirname "$common")" 2>/dev/null)" ||
+      { orch_project_root "$start" >/dev/null; return 1; }
+  fi
   if [ ! -f "$root/.orch" ]; then
     echo "orch: $root/.orch not found. Run the orchestration:setup-project skill first." >&2
     return 1

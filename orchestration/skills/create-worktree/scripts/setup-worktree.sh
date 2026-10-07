@@ -18,25 +18,19 @@ set -euo pipefail
 # import, no drush deploy. It is passed on to a project's provision hook.
 
 # --- Configuration ----------------------------------------------------------
+#
+# Project config comes from the shared resolver (scripts/orch-project.sh):
+# environment, then <project root>/.orch, then the default. The project root
+# is found by walking up from $PWD, so this runs from anywhere inside it.
+#   BASE_BRANCH     branch new worktrees are cut from; required, no fallback
+#   DB_DUMP         dump to import; relative paths resolve against the root
+#   WORKTREE_ROOT   where worktrees live; default <root>/code
+#   PROJECT_NAME    DDEV names: <id>-<PROJECT_NAME>; main checkout <PROJECT_NAME>
+#   PROVISION_HOOK  see resolve_provision_hook
 
-# Branch new worktrees are cut from, resolved after the main checkout is
-# known (see the BASE_BRANCH block below). Precedence: an explicit
-# BASE_BRANCH in the environment, then BASE_BRANCH in the main checkout's
-# .env. Neither resolving is a hard refusal -- no literal fallback.
-BASE_BRANCH_ENV="${BASE_BRANCH-}"
-
-# Database dump to import. Relative paths resolve against the main checkout.
-# No default here -- a project that wants one (e.g. a fixed path like
-# db/trunk.sql.gz) sets it in its own shim or its main checkout's .env.
-# Precedence: environment, then the main checkout's .env, then skip the
-# import with a message.
-DB_DUMP_ENV="${DB_DUMP-}"
-
-# Where worktrees live. Defaults to the MAIN CHECKOUT'S OWN BASENAME, not a
-# hardcoded project name, so a checkout literally named "acme-site" still
-# gets worktrees under .../worktrees/acme-site (protects live DDEV project
-# names), while any other project gets its own directory automatically.
-WORKTREE_ROOT_ENV="${WORKTREE_ROOT-}"
+ORCH_PROJECT_LIB="${ORCH_PROJECT_LIB:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd -P)/scripts/orch-project.sh}"
+# shellcheck source=../../../scripts/orch-project.sh
+. "$ORCH_PROJECT_LIB"
 
 # --no-db may appear anywhere in the arguments; strip it so the positional
 # contract (<id> | --provision) is unchanged.
@@ -51,77 +45,6 @@ done
 set -- ${_args[@]+"${_args[@]}"}
 
 # ----------------------------------------------------------------------------
-
-# --- Shared DDEV project name rule (ticket #393, generalized by the
-#     worktree-promotion-spec) --------------------------------------------
-#
-# Duplicated (not sourced) in retire-worktree.sh's copy -- both scripts'
-# test harnesses copy a single file into a throwaway sandbox, so a shared lib
-# file would not travel with them. The two copies must never drift; see
-# tests/worktree-naming-parity.test.sh.
-#
-# ddev_project_name <branch-or-id> <main-checkout-basename> -> DDEV project
-# name. Both the id and the main-checkout basename are sanitized the same
-# way (lowercase, non-`a-z0-9-` to `-`, collapse runs, strip leading/trailing
-# `-`, cap at 3 hyphen-separated segments -- except the id's leading segment,
-# which keeps its WHOLE digit run uncapped when it is all-digit, so ticket
-# numbers never truncate). <main-checkout-basename> is REQUIRED -- no
-# "acme-site" default lives here; a generic engine defaulting to one
-# project's name is exactly the hardcoding this split exists to remove
-# (worktree-promotion-spec.md done-criterion 3). Every call site in this
-# engine resolves and passes the real basename explicitly.
-#
-# LC_ALL=C is pinned on the tr/sed pass -- under a UTF-8 locale, tr/sed's
-# character classes treat accented letters as already-lowercase "letters"
-# and pass them through unsanitized, which DDEV then rejects as an invalid
-# project name.
-ddev_project_name() {
-  local raw="$1" main_basename="$2"
-
-  _dpn_sanitize() { # <input> -> lowercased, sanitized, hyphen-collapsed
-    local lower
-    lower="$(printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
-    printf '%s' "$lower" | LC_ALL=C sed -E 's/[^a-z0-9-]/-/g; s/-+/-/g; s/^-//; s/-$//'
-  }
-
-  local sanitized first id_part i
-  sanitized="$(_dpn_sanitize "$raw")"
-  local -a segs
-  IFS='-' read -r -a segs <<< "$sanitized"
-  first="${segs[0]:-}"
-  if [[ "$first" =~ ^[0-9]+$ ]]; then
-    id_part="$first"
-  else
-    id_part="${segs[0]:-}"
-    for i in 1 2; do
-      [ -n "${segs[$i]:-}" ] && id_part="$id_part-${segs[$i]}"
-    done
-    [ -z "$id_part" ] && id_part="worktree"
-  fi
-
-  local bsanitized basename_part j
-  bsanitized="$(_dpn_sanitize "$main_basename")"
-  local -a bsegs
-  IFS='-' read -r -a bsegs <<< "$bsanitized"
-  basename_part="${bsegs[0]:-}"
-  for j in 1 2; do
-    [ -n "${bsegs[$j]:-}" ] && basename_part="$basename_part-${bsegs[$j]}"
-  done
-  [ -z "$basename_part" ] && basename_part="worktree"
-
-  printf '%s-%s' "$id_part" "$basename_part"
-}
-
-# --- Small .env reader (never sourced -- a single sed pass so an unrelated
-#     line in .env cannot abort the run under `set -euo pipefail`). ---------
-read_dotenv_var() { # read_dotenv_var <repo> <VAR> -> value or empty
-  local repo="$1" var="$2"
-  [ -f "$repo/.env" ] || return 0
-  sed -n "s/^[[:space:]]*${var}[[:space:]]*=[[:space:]]*//p" "$repo/.env" |
-    tail -n 1 |
-    tr -d '\r' |
-    sed -e "s/^['\"]//" -e "s/['\"]\$//"
-}
 
 # --- Drupal detection + post-fresh-import `drush deploy` (shared by both
 #     provisioning legs) ------------------------------------------------------
@@ -182,26 +105,14 @@ run_provision() {
   local worktree main_repo dump branch name existing_name
 
   worktree="$PWD"
-  main_repo="${MAIN_REPO_OVERRIDE:-}"
+  orch_resolve "$worktree" || exit 1
+  main_repo="${MAIN_REPO_OVERRIDE:-$MAIN_CHECKOUT}"
 
-  if [ -z "$main_repo" ]; then
-    main_repo="$(dirname "$(git -C "$worktree" rev-parse --path-format=absolute --git-common-dir)")"
-  fi
-
-  # Dump resolution: environment (DB_DUMP), then the main checkout's .env,
-  # then none at all -- same precedence as mode 1's DB_DUMP, and NO
-  # project-specific literal path here. A project that wants one sets
-  # DB_DUMP itself (its shim exports it before delegating, in either mode).
-  dump="${DB_DUMP-}"
-  if [ -z "$dump" ]; then
-    dump="$(read_dotenv_var "$main_repo" DB_DUMP)"
-  fi
-  if [ -n "$dump" ]; then
-    case "$dump" in
-      /*) : ;;
-      *) dump="$main_repo/$dump" ;;
-    esac
-  fi
+  # Dump resolution: environment (DB_DUMP), then .orch, then none at all --
+  # same precedence as mode 1's DB_DUMP, and NO project-specific literal path
+  # here.
+  dump="$(orch_get "$ORCH_ROOT" DB_DUMP)"
+  [ -z "$dump" ] || dump="$(orch_abs "$ORCH_ROOT" "$dump")"
 
   cd "$worktree"
 
@@ -219,7 +130,7 @@ run_provision() {
   branch="$(git -C "$worktree" symbolic-ref --quiet --short HEAD || true)"
   branch="${branch:-$(basename "$worktree")}"
 
-  name="$(ddev_project_name "$branch" "$(basename "$main_repo")")"
+  name="$(ddev_project_name "$branch" "$PROJECT_NAME")"
 
   # Guard against re-provisioning a worktree already registered under a
   # different name (an earlier naming-rule change, or a changed $branch
@@ -299,49 +210,41 @@ if ! [[ "$id" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
   exit 1
 fi
 
-main_repo="$(git rev-parse --show-toplevel)"
-main_basename="$(basename "$main_repo")"
+orch_resolve "$PWD" || exit 1
+main_repo="$MAIN_CHECKOUT"
 
-WORKTREE_ROOT="${WORKTREE_ROOT_ENV:-$HOME/Projects/worktrees/$main_basename}"
+# --- Resolve BASE_BRANCH: environment, then .orch. No other fallback --
+#     deliberately NOT the branch checked out where this script runs. A
+#     caller often runs this from inside a linked worktree already on its own
+#     ticket branch, and silently cutting from that is never what was meant.
+#     Refusing and creating nothing beats guessing. ---
+BASE_BRANCH="$(orch_get "$ORCH_ROOT" BASE_BRANCH)"
+if [ -z "$BASE_BRANCH" ]; then
+  echo "setup-worktree: BASE_BRANCH is not set in the environment or in $ORCH_ROOT/.orch; refusing to guess. Set BASE_BRANCH and try again." >&2
+  exit 1
+fi
+[ -n "$_ORCH_ENV_BASE_BRANCH" ] || echo "setup-worktree: BASE_BRANCH=$BASE_BRANCH from $ORCH_ROOT/.orch."
 
-# --- Resolve BASE_BRANCH: environment, then the main checkout's .env. No
-#     other fallback -- deliberately NOT the branch checked out where this
-#     script runs, even though that is resolvable. A caller often runs this
-#     from inside a LINKED worktree already sitting on its own ticket branch
-#     (e.g. running from a worktree, to spin up a second one), and
-#     silently cutting a new worktree from whatever that branch happens to
-#     be is never what was meant -- see AGENTS.md's "Base branch comes from
-#     BASE_BRANCH ... every worktree branches off it" and both SKILL.mds. A
-#     generic engine with no project config at all has no safe guess here
-#     (unlike a checkout named after its project, whose old project-local
-#     script had a specific base branch hardcoded directly behind it);
-#     refusing and creating nothing beats guessing. ---
-if [ -n "$BASE_BRANCH_ENV" ]; then
-  BASE_BRANCH="$BASE_BRANCH_ENV"
-else
-  base_branch_dotenv="$(read_dotenv_var "$main_repo" BASE_BRANCH)"
-  if [ -n "$base_branch_dotenv" ]; then
-    BASE_BRANCH="$base_branch_dotenv"
-    echo "setup-worktree: BASE_BRANCH=$BASE_BRANCH from $main_repo/.env."
-  else
-    echo "setup-worktree: BASE_BRANCH is not set in the environment or in $main_repo/.env; refusing to guess. Set BASE_BRANCH and try again." >&2
-    exit 1
+# --- Resolve DB_DUMP (mode 1): environment, then .orch, then none at all --
+#     no literal default in this engine. ---------------------------------
+DUMP_MODE1="$(orch_get "$ORCH_ROOT" DB_DUMP)"
+[ -z "$DUMP_MODE1" ] || DUMP_MODE1="$(orch_abs "$ORCH_ROOT" "$DUMP_MODE1")"
+
+# --- The main checkout's own DDEV name is <PROJECT_NAME>. Written once when
+#     the main checkout has .ddev/ and no name yet; a different name already
+#     there is left alone (renaming would strand its database). ---
+ensure_main_ddev_name() {
+  local cfg="$main_repo/.ddev/config.local.yaml" existing
+  [ -d "$main_repo/.ddev" ] || return 0
+  existing=""
+  [ -f "$cfg" ] && existing="$(sed -n 's/^name:[[:space:]]*//p' "$cfg" | tail -n 1 | tr -d '\r')"
+  if [ -z "$existing" ]; then
+    printf 'name: %s\n' "$PROJECT_NAME" >> "$cfg"
+    echo "setup-worktree: named the main checkout's DDEV project '$PROJECT_NAME'."
+  elif [ "$existing" != "$PROJECT_NAME" ]; then
+    echo "setup-worktree: WARNING: the main checkout's DDEV project is named '$existing', not '$PROJECT_NAME'. Leaving it alone." >&2
   fi
-fi
-
-# --- Resolve DB_DUMP (mode 1): environment, then the main checkout's .env,
-#     then none at all -- no literal default in this engine. ----------------
-if [ -n "$DB_DUMP_ENV" ]; then
-  DUMP_MODE1="$DB_DUMP_ENV"
-else
-  DUMP_MODE1="$(read_dotenv_var "$main_repo" DB_DUMP)"
-fi
-if [ -n "$DUMP_MODE1" ]; then
-  case "$DUMP_MODE1" in
-    /*) : ;;
-    *) DUMP_MODE1="$main_repo/$DUMP_MODE1" ;;
-  esac
-fi
+}
 
 worktree=""
 
@@ -366,7 +269,7 @@ own_provision_mode1() {
   # that ships real DDEV config but no composer.json (AC8). Neither present
   # (AC6/AC7/AC9) is the one case that truly skips this whole leg.
   if [ -d "$wt/.ddev" ] || [ -f "$wt/composer.json" ]; then
-    name="$(ddev_project_name "$id" "$(basename "$main")")"
+    name="$(ddev_project_name "$id" "$PROJECT_NAME")"
     mkdir -p "$wt/.ddev"
     printf 'name: %s\n' "$name" > "$wt/.ddev/config.local.yaml"
 
@@ -422,11 +325,8 @@ resolve_provision_hook() { # resolve_provision_hook <worktree> <main_repo> -> pr
   # env/.env, so a STALE PROVISION_HOOK left over in .env from an earlier
   # setup hard-failed provisioning instead of falling through to the
   # engine's own mode-1 logic like the spec says it should).
-  if [ -n "${PROVISION_HOOK-}" ] && [ -f "${PROVISION_HOOK-}" ]; then
-    printf '%s' "$PROVISION_HOOK"
-    return 0
-  fi
-  val="$(read_dotenv_var "$main" PROVISION_HOOK)"
+  val="$(orch_get "$ORCH_ROOT" PROVISION_HOOK)"
+  [ -z "$val" ] || val="$(orch_abs "$ORCH_ROOT" "$val")"
   if [ -n "$val" ] && [ -f "$val" ]; then
     printf '%s' "$val"
     return 0
@@ -502,6 +402,7 @@ precreate_check() {
 }
 
 worktree="$WORKTREE_ROOT/$id"
+ensure_main_ddev_name
 precreate_check
 git_worktree_add
 provision_after_create "$worktree" "$main_repo"

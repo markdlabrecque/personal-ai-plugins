@@ -76,6 +76,14 @@ trap 'rm -rf "$SANDBOX_BASE"' EXIT
 
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 
+# The sandbox itself is the project root (an empty .orch); each run names its
+# own main checkout through MAIN_CHECKOUT. The engine runs from a copy, so
+# point it at the real resolver.
+export ORCH_PROJECTS_DIR="$(dirname "$SANDBOX_BASE")"
+export ORCH_PROJECT_LIB="$(cd "$SKILL_DIR/../.." && pwd -P)/scripts/orch-project.sh"
+unset PROJECT_NAME MAIN_CHECKOUT BASE_BRANCH WORKTREE_ROOT
+: > "$SANDBOX_BASE/.orch"
+
 PASS=0
 FAIL=0
 SKIP=0
@@ -293,7 +301,7 @@ CODE=0
 run_reap() {
   local outf errf
   outf="$(mktemp)"; errf="$(mktemp)"
-  ( cd "$MAIN" && PATH="$MINIMAL_PATH" WORKTREE_ROOT="$WTROOT" RETIRE_LOG="$RETIRE_LOG" BASE_BRANCH=trunk \
+  ( cd "$MAIN" && MAIN_CHECKOUT="$MAIN" PATH="$MINIMAL_PATH" WORKTREE_ROOT="$WTROOT" RETIRE_LOG="$RETIRE_LOG" BASE_BRANCH=trunk \
       bash "$MAIN/scripts/reap-worktrees.sh" "$@" ) >"$outf" 2>"$errf"
   CODE=$?
   OUT="$(cat "$outf")"
@@ -472,7 +480,7 @@ EOF
 chmod +x "$FF_MAIN/scripts/retire-worktree.sh"
 
 outf="$(mktemp)"; errf="$(mktemp)"
-( cd "$FF_MAIN" && PATH="$MINIMAL_PATH" WORKTREE_ROOT="$FF_WTROOT" BASE_BRANCH=trunk bash "$FF_MAIN/scripts/reap-worktrees.sh" ) >"$outf" 2>"$errf"
+( cd "$FF_MAIN" && MAIN_CHECKOUT="$FF_MAIN" PATH="$MINIMAL_PATH" WORKTREE_ROOT="$FF_WTROOT" BASE_BRANCH=trunk bash "$FF_MAIN/scripts/reap-worktrees.sh" ) >"$outf" 2>"$errf"
 FF_CODE=$?
 FF_OUT="$(cat "$outf")"; FF_ERR="$(cat "$errf")"; rm -f "$outf" "$errf"
 
@@ -558,7 +566,7 @@ EOF
 chmod +x "$NR_MAIN/scripts/retire-worktree.sh"
 
 outf="$(mktemp)"; errf="$(mktemp)"
-( cd "$NR_MAIN" && PATH="$MINIMAL_PATH" WORKTREE_ROOT="$NR_WTROOT" BASE_BRANCH=trunk bash "$NR_MAIN/scripts/reap-worktrees.sh" ) >"$outf" 2>"$errf"
+( cd "$NR_MAIN" && MAIN_CHECKOUT="$NR_MAIN" PATH="$MINIMAL_PATH" WORKTREE_ROOT="$NR_WTROOT" BASE_BRANCH=trunk bash "$NR_MAIN/scripts/reap-worktrees.sh" ) >"$outf" 2>"$errf"
 NR_CODE=$?
 NR_OUT="$(cat "$outf")"; NR_ERR="$(cat "$errf")"; rm -f "$outf" "$errf"
 
@@ -664,7 +672,7 @@ cp "$SCRIPT_SRC" "$WB_MAIN/scripts/reap-worktrees.sh" 2>/dev/null && chmod +x "$
 cp "$RETIRE_SCRIPT_SRC" "$WB_MAIN/scripts/retire-worktree.sh" 2>/dev/null && chmod +x "$WB_MAIN/scripts/retire-worktree.sh"
 
 outf="$(mktemp)"; errf="$(mktemp)"
-( cd "$WB_MAIN" && PATH="$MINIMAL_PATH" WORKTREE_ROOT="$WB_WTROOT" BASE_BRANCH=trunk bash "$WB_MAIN/scripts/reap-worktrees.sh" ) >"$outf" 2>"$errf"
+( cd "$WB_MAIN" && MAIN_CHECKOUT="$WB_MAIN" PATH="$MINIMAL_PATH" WORKTREE_ROOT="$WB_WTROOT" BASE_BRANCH=trunk bash "$WB_MAIN/scripts/reap-worktrees.sh" ) >"$outf" 2>"$errf"
 WB_CODE=$?
 WB_OUT="$(cat "$outf")"; WB_ERR="$(cat "$errf")"; rm -f "$outf" "$errf"
 
@@ -727,7 +735,7 @@ EOF
   chmod +x "$main/scripts/retire-worktree.sh"
   local outf errf
   outf="$(mktemp)"; errf="$(mktemp)"
-  ( cd "$main" && PATH="$MINIMAL_PATH" WORKTREE_ROOT="$wtroot" BASE_BRANCH=trunk bash "$main/scripts/reap-worktrees.sh" ) >"$outf" 2>"$errf"
+  ( cd "$main" && MAIN_CHECKOUT="$main" PATH="$MINIMAL_PATH" WORKTREE_ROOT="$wtroot" BASE_BRANCH=trunk bash "$main/scripts/reap-worktrees.sh" ) >"$outf" 2>"$errf"
   CODE=$?
   OUT="$(cat "$outf")"; ERR="$(cat "$errf")"; rm -f "$outf" "$errf"
 }
@@ -847,18 +855,18 @@ stderr: $ERR"
 fi
 
 # ===========================================================================
-# RE. Genericization (worktree-promotion-spec.md item 5): WORKTREE_ROOT
-#     defaults to $HOME/Projects/worktrees/<main-checkout-basename>, not a
-#     hardcoded .../acme-site -- matching setup-worktree.sh and
-#     retire-worktree.sh. Uses a fake $HOME so this never touches the real
-#     one.
+# RE. Default layout: WORKTREE_ROOT defaults to <project root>/code, which
+#     also holds the main checkout. Run from the project root with only
+#     BASE_BRANCH in .orch: the landed worktree is reaped, the main checkout
+#     is never touched.
 # ===========================================================================
 RE_REMOTE_DIR="$SANDBOX_BASE/re-remote.git"
-RE_ROOT="$SANDBOX_BASE/re"
-RE_MAIN="$RE_ROOT/some-other-checkout"
-RE_HOME="$RE_ROOT/fake-home"
-RE_WTROOT="$RE_HOME/Projects/worktrees/some-other-checkout"
-mkdir -p "$RE_HOME"
+RE_PROJECTS="$SANDBOX_BASE/re-projects"
+RE_ROOT="$RE_PROJECTS/re"
+RE_WTROOT="$RE_ROOT/code"
+RE_MAIN="$RE_WTROOT/some-other-checkout"
+mkdir -p "$RE_WTROOT"
+printf 'BASE_BRANCH=trunk\n' > "$RE_ROOT/.orch"
 
 git init -q --bare "$RE_REMOTE_DIR" >/dev/null 2>&1
 git clone -q "$RE_REMOTE_DIR" "$RE_MAIN" >/dev/null 2>&1
@@ -871,7 +879,6 @@ git clone -q "$RE_REMOTE_DIR" "$RE_MAIN" >/dev/null 2>&1
   git push -q -u origin trunk
 ) >/dev/null 2>&1
 
-mkdir -p "$RE_WTROOT"
 git -C "$RE_MAIN" worktree add -q -b re-landed "$RE_WTROOT/re-landed" trunk >/dev/null 2>&1
 mk_commit "$RE_WTROOT/re-landed" re.txt "re content" "re-landed commit"
 (cd "$RE_MAIN" && git checkout -q trunk && git merge -q --no-ff re-landed -m "merge re-landed" && git push -q origin trunk) >/dev/null 2>&1
@@ -881,14 +888,14 @@ cp "$SCRIPT_SRC" "$RE_MAIN/scripts/reap-worktrees.sh" 2>/dev/null && chmod +x "$
 cp "$RETIRE_SCRIPT_SRC" "$RE_MAIN/scripts/retire-worktree.sh" 2>/dev/null && chmod +x "$RE_MAIN/scripts/retire-worktree.sh"
 
 re_outf="$(mktemp)"; re_errf="$(mktemp)"
-( cd "$RE_MAIN" && env -u WORKTREE_ROOT PATH="$MINIMAL_PATH" HOME="$RE_HOME" BASE_BRANCH=trunk \
+( cd "$RE_ROOT" && ORCH_PROJECTS_DIR="$RE_PROJECTS" PATH="$MINIMAL_PATH" \
     bash "$RE_MAIN/scripts/reap-worktrees.sh" ) >"$re_outf" 2>"$re_errf"
 re_rc=$?
 
-if [ "$re_rc" -eq 0 ] && [ ! -e "$RE_WTROOT/re-landed" ]; then
-  pass "RE1: WORKTREE_ROOT defaults to \$HOME/Projects/worktrees/<main-checkout-basename> (a landed branch there was found and reaped)"
+if [ "$re_rc" -eq 0 ] && [ ! -e "$RE_WTROOT/re-landed" ] && [ -d "$RE_MAIN/.git" ]; then
+  pass "RE1: in the default layout a landed worktree in <root>/code is reaped and the main checkout beside it is kept"
 else
-  fail "RE1: WORKTREE_ROOT must default to \$HOME/Projects/worktrees/<main-checkout-basename>, not a hardcoded acme-site path" \
+  fail "RE1: default layout must reap <root>/code/re-landed and keep the main checkout" \
 "exit $re_rc
 stdout: $(cat "$re_outf")
 stderr: $(cat "$re_errf")"
@@ -930,7 +937,7 @@ cp "$RETIRE_SCRIPT_SRC" "$RB_MAIN/scripts/retire-worktree.sh" && chmod +x "$RB_M
 # Deliberately no .env in $RB_MAIN.
 
 rb_outf="$(mktemp)"; rb_errf="$(mktemp)"
-( cd "$RB_MAIN" && env -u BASE_BRANCH PATH="$MINIMAL_PATH" WORKTREE_ROOT="$RB_WTROOT" \
+( cd "$RB_MAIN" && env -u BASE_BRANCH MAIN_CHECKOUT="$RB_MAIN" PATH="$MINIMAL_PATH" WORKTREE_ROOT="$RB_WTROOT" \
     bash "$RB_MAIN/scripts/reap-worktrees.sh" ) >"$rb_outf" 2>"$rb_errf"
 rb_rc=$?
 

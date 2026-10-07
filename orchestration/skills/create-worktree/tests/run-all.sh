@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 #
-# Runs all worktree-tooling suites -- the two that live here
-# (create-worktree/tests/) plus the two sibling suites in
-# retire-worktree/tests/ -- and prints a per-suite verdict plus a combined
+# Runs all worktree-tooling suites -- create-worktree's own, the two in
+# retire-worktree/tests/ and setup-project's -- and prints a per-suite verdict plus a combined
 # summary. Exit 1 if any suite failed (a non-zero exit OR a non-empty
 # "N failed" count in its own summary line), exit 0 only when every suite is
 # green.
@@ -24,7 +23,6 @@ RETIRE_WORKTREE_TESTS="$RETIRE_WORKTREE_DIR/tests"
 
 SUITES=(
   "$CREATE_WORKTREE_TESTS/setup-worktree-agent.test.sh"
-  "$CREATE_WORKTREE_TESTS/worktree-naming-parity.test.sh"
   "$RETIRE_WORKTREE_TESTS/retire-worktree.test.sh"
   "$RETIRE_WORKTREE_TESTS/reap-worktrees.test.sh"
   "$CREATE_WORKTREE_DIR/../setup-project/tests/setup-project.test.sh"
